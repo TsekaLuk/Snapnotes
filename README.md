@@ -1,187 +1,75 @@
-# any2md - Convert Any Document to Markdown
+# Snapnotes
 
-<div align="right">
-  <a href="README.md">English</a> | <a href="README_CN.md">中文文档</a>
-</div>
+任何PDF、PPT/PPTX或PNG系列转Obsidian Markdown，支持Qwen-VL智能图片定位和可选的DeepSeek精炼。
 
-`any2md` is a powerful Python utility that converts various document formats (PDF, PPT/PPTX, PNG) into high-quality Markdown. It's designed to preserve the original document structure, styling, and content while transforming it into a format that's easy to use with Obsidian.
+## 功能特点
 
-## Features
+- 支持任何PDF（纯图片/富文本）、PPT/PPTX文件和PNG系列图片 → 高质量Obsidian Markdown自动转换
+- 集成两种图片提取模式：PyMuPDF（适合富文本PDF）、Qwen2.5-VL智能定位（适合纯图片PDF和PPT）
+- 支持多页并发、API自动重试、图片裁剪、图片占位符自动替换
+- 支持可选的图像定位可视化调试
 
-- **Multi-format Support**: Process PDFs (both image-only and rich text), PowerPoint presentations (PPT/PPTX), and PNG image series
-- **Smart Content Extraction**:
-  - **PyMuPDF Mode**: Best for rich text PDFs with extractable content
-  - **Qwen-VL Mode**: AI-powered image analysis for content localization in image-only PDFs and presentations
-- **Intelligent Processing**:
-  - Preserves document structure with proper Markdown hierarchy
-  - Converts tables to Markdown format when possible
-  - Accurately handles LaTeX mathematical expressions
-  - Maintains image references with proper descriptions
-- **Performance Optimizations**:
-  - Multi-page concurrency for faster processing
-  - API auto-retry mechanisms for stability
-  - Configurable worker threads
-- **Enhanced Workflow**:
-  - Automatic image cropping and extraction
-  - Image placeholder replacement
-  - Optional visualization for debugging
-  - Markdown refinement with DeepSeek V2.5 (optional)
+## 安装
 
-## Requirements
+### 使用uv安装（推荐）
 
-### Core Dependencies
+[uv](https://github.com/astral-sh/uv) 是一个快速的Python包管理器和虚拟环境工具，比pip快得多。
+
+1. 安装uv:
 
 ```bash
-pip install requests fitz pdf2image Pillow tqdm python-dotenv tenacity
+curl -sSf https://astral.sh/uv/install.sh | sh
 ```
 
-### Optional Dependencies
+或者对于Windows PowerShell:
 
-- **LibreOffice**: Required for PPT/PPTX processing
-  - Windows: Download from [libreoffice.org](https://www.libreoffice.org/download/download/)
-  - Linux: `sudo apt install libreoffice`
-  - macOS: `brew install libreoffice`
+```pwsh
+powershell -c "irm https://astral.sh/uv/install.ps1 | iex"
+```
 
-- **Additional Python Packages** (Windows-specific):
-  ```bash
-  pip install comtypes pyautogui
-  ```
+2. 创建虚拟环境并安装依赖:
 
-## API Configuration
+```bash
+uv venv
+uv pip install -e .
+```
 
-This tool uses AI services for document analysis. Create a `.env` file in the same directory with:
+3. 对于Windows用户，添加可选依赖:
+
+```bash
+uv pip install -e ".[windows]"
+```
+
+### 使用传统pip安装
+
+如果您更习惯于使用pip:
+
+```bash
+pip install -r requirements.txt
+```
+
+## 使用方法
+
+```bash
+python any2md.py 输入文件.pdf -o ./输出目录
+```
+
+或者使用更多选项:
+
+```bash
+python any2md.py 输入文件.pdf --dpi 300 --image-extraction-method qwen_vl --visualize-localization --enable-refinement
+```
+
+## 环境变量
+
+在项目根目录创建`.env`文件并配置以下变量:
 
 ```
+SF_API_KEY=你的API密钥
 SF_API_URL=https://api.siliconflow.cn/v1/chat/completions
-SF_API_KEY=your_api_key_here
 SF_MODEL=Qwen/Qwen2.5-VL-72B-Instruct
-SF_MAX_WORKERS=10
-MAX_CONCURRENT_API_CALLS=3
-
-# Optional: For markdown refinement
-REFINEMENT_MODEL=deepseek-ai/DeepSeek-V2.5
-REFINEMENT_API_URL=https://api.siliconflow.cn/v1/chat/completions
-REFINEMENT_API_KEY=your_api_key_here
 ```
 
-**Parameters Explained:**
-- `SF_MAX_WORKERS`: Controls the total number of parallel worker threads for all tasks (image processing, file handling, etc.)
-- `MAX_CONCURRENT_API_CALLS`: Limits the number of simultaneous API requests to the AI service to avoid rate limiting
-  
-The difference is important - while `SF_MAX_WORKERS` determines overall parallelization of the program, `MAX_CONCURRENT_API_CALLS` specifically prevents too many API calls at once. If you experience API rate limiting errors, try reducing `MAX_CONCURRENT_API_CALLS` while keeping `SF_MAX_WORKERS` higher for efficient local processing.
+## 许可证
 
-## Usage
-
-### Basic Usage
-
-```bash
-python any2md.py input_file.pdf -o ./output --enable-refinement
-```
-
-### Process an Entire Directory
-
-```bash
-python any2md.py ./documents -o ./converted --enable-refinement
-```
-
-### Advanced Options
-
-```bash
-# Use PyMuPDF extraction method for PDFs
-python any2md.py document.pdf --image-extraction-method pymupdf
-
-# Set custom DPI for image conversion
-python any2md.py presentation.pptx --dpi 400
-
-# Enable visualization of detected regions
-python any2md.py document.pdf --visualize-localization
-
-# Enable markdown refinement with DeepSeek
-python any2md.py document.pdf --enable-refinement
-
-# Set custom number of worker threads
-python any2md.py document.pdf -w 5
-```
-
-### Command Line Arguments
-
-| Argument | Description |
-|----------|-------------|
-| `input_path` | PDF/PPT/PPTX file, PNG file, or directory containing these files |
-| `-o, --output` | Output directory (default: ./output) |
-| `--dpi` | DPI for PDF/presentation to image conversion (default: 300) |
-| `--image-extraction-method` | Image extraction method: qwen_vl (smart localization) or pymupdf (embedded images) |
-| `--visualize-localization` | Visualize Qwen-VL localization results |
-| `--enable-refinement` | Enable second-stage Markdown refinement using DeepSeek |
-| `-w, --workers` | Number of parallel worker threads |
-| `--no-clean-temp` | Disable automatic cleanup of temporary files |
-
-## How It Works
-
-1. **Document Processing**:
-   - PDFs are converted to images page by page
-   - PPT/PPTX files are converted to PDF using LibreOffice, then to images
-   - PNG images are processed directly or as series
-
-2. **Content Analysis**:
-   - In `qwen_vl` mode: AI identifies text, images, tables, and other content regions
-   - In `pymupdf` mode: Embedded images are extracted directly
-
-3. **Markdown Generation**:
-   - Text content is converted to proper Markdown with headings, lists, etc.
-   - LaTeX math expressions are preserved between $ or $$ delimiters
-   - Tables are converted to Markdown format when possible
-   - Images are extracted, saved, and properly referenced
-
-4. **Refinement (Optional)**:
-   - The generated Markdown is analyzed and improved for readability
-   - Duplicate headers, inconsistent formatting, and other issues are fixed
-
-## Output Structure
-
-For each document, the tool creates:
-- A Markdown file with the same name as the input file
-- An assets directory containing extracted images
-- Optional debug visualization files when enabled
-
-## Limitations
-
-- Complex tables may be extracted as images rather than Markdown tables
-- Processing quality depends on the API services and their models
-- PPT/PPTX processing requires LibreOffice installation
-
-## License
-
-This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
-
-```
-MIT License
-
-Copyright (c) 2023 TsekaLuk (https://github.com/TsekaLuk)
-
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
-
-The above copyright notice and this permission notice shall be included in all
-copies or substantial portions of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-SOFTWARE.
-```
-
-## Acknowledgments
-
-This tool leverages several powerful open-source libraries and AI models:
-- PyMuPDF for PDF processing
-- Qwen2.5-VL for visual content analysis
-- DeepSeek V2.5 for Markdown refinement
-- LibreOffice for presentation conversion
+MIT

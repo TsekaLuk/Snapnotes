@@ -1,0 +1,32 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "snapnotes"
+version = "0.1.0"
+description = "任何PDF、PPT/PPTX或PNG系列转Obsidian Markdown，支持Qwen-VL智能图片定位和可选的DeepSeek精炼"
+readme = "README.md"
+requires-python = ">=3.8"
+authors = [
+    {name = "Snapnotes Developer", email = "example@example.com"},
+]
+dependencies = [
+    "pdf2image",
+    "Pillow",
+    "tqdm",
+    "python-dotenv",
+    "requests",
+    "tenacity",
+    "PyMuPDF",
+    "pyautogui",
+]
+
+[project.optional-dependencies]
+windows = ["comtypes"]
+
+[project.scripts]
+any2md = "any2md:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["any2md.py"] 
