@@ -75,13 +75,13 @@ The difference is important - while `SF_MAX_WORKERS` determines overall parallel
 ### Basic Usage
 
 ```bash
-python any2md.py input_file.pdf -o ./output
+python any2md.py input_file.pdf -o ./output --enable-refinement
 ```
 
 ### Process an Entire Directory
 
 ```bash
-python any2md.py ./documents -o ./converted
+python any2md.py ./documents -o ./converted --enable-refinement
 ```
 
 ### Advanced Options

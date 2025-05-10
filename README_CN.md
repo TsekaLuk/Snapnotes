@@ -75,13 +75,13 @@ REFINEMENT_API_KEY=your_api_key_here
 ### 基本用法
 
 ```bash
-python any2md.py input_file.pdf -o ./output
+python any2md.py input_file.pdf -o ./output --enable-refinement
 ```
 
 ### 处理整个目录
 
 ```bash
-python any2md.py ./documents -o ./converted
+python any2md.py ./documents -o ./converted --enable-refinement
 ```
 
 ### 高级选项
