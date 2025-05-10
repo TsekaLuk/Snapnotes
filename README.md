@@ -1,10 +1,10 @@
-# any2md - Convert Any Document to Obsidian Markdown
+# any2md - Convert Any Document to Markdown
 
 <div align="right">
   <a href="README.md">English</a> | <a href="README_CN.md">中文文档</a>
 </div>
 
-`any2md` is a powerful Python utility that converts various document formats (PDF, PPT/PPTX, PNG) into high-quality Obsidian-flavored Markdown. It's designed to preserve the original document structure, styling, and content while transforming it into a format that's easy to use with Obsidian.
+`any2md` is a powerful Python utility that converts various document formats (PDF, PPT/PPTX, PNG) into high-quality Markdown. It's designed to preserve the original document structure, styling, and content while transforming it into a format that's easy to use with Obsidian.
 
 ## Features
 
