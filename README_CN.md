@@ -83,9 +83,12 @@ pip install -r requirements.txt
 
 ## API配置
 
-此工具使用AI服务进行文档分析。在同一目录下创建一个`.env`文件，内容如下：
+此工具使用AI服务进行文档分析。虽然它兼容任何实现了兼容接口的API服务，但我们推荐使用硅基流动(SiliconFlow)的API服务，因为所有的测试和开发都是基于这个平台进行的。
+
+在同一目录下创建一个`.env`文件，内容如下：
 
 ```
+# 硅基流动API配置（推荐）
 SF_API_URL=https://api.siliconflow.cn/v1/chat/completions
 SF_API_KEY=your_api_key_here
 SF_MODEL=Qwen/Qwen2.5-VL-72B-Instruct

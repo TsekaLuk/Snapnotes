@@ -83,9 +83,12 @@ pip install -r requirements.txt
 
 ## API Configuration
 
-This tool uses AI services for document analysis. Create a `.env` file in the same directory with:
+This tool uses AI services for document analysis. While it's compatible with any API service that implements a compatible interface, we recommend using SiliconFlow's API service as all testing and development were done using this platform.
+
+Create a `.env` file in the same directory with:
 
 ```
+# SiliconFlow API configuration (recommended)
 SF_API_URL=https://api.siliconflow.cn/v1/chat/completions
 SF_API_KEY=your_api_key_here
 SF_MODEL=Qwen/Qwen2.5-VL-72B-Instruct
