@@ -32,6 +32,10 @@
 ### 核心依赖
 
 ```bash
+# 使用 uv（推荐）
+uv pip install -r requirements.txt
+
+# 或使用 pip
 pip install requests fitz pdf2image Pillow tqdm python-dotenv tenacity
 ```
 
@@ -44,8 +48,38 @@ pip install requests fitz pdf2image Pillow tqdm python-dotenv tenacity
 
 - **额外的Python包**（Windows特有）：
   ```bash
+  # 使用 uv
+  uv pip install comtypes pyautogui
+  
+  # 或使用 pip
   pip install comtypes pyautogui
   ```
+
+## 安装
+
+### 安装 uv（可选但推荐）
+
+```bash
+# 使用 pipx 安装 uv（推荐）
+pipx install uv
+
+# 或使用 pip 直接安装
+pip install uv
+```
+
+### 安装 any2md
+
+```bash
+# 克隆仓库
+git clone https://github.com/TsekaLuk/any2md.git
+cd any2md
+
+# 使用 uv 安装依赖
+uv pip install -r requirements.txt
+
+# 或使用 pip（如果您更喜欢）
+pip install -r requirements.txt
+```
 
 ## API配置
 

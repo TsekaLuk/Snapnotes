@@ -1,32 +1,50 @@
 [build-system]
-requires = ["hatchling"]
-build-backend = "hatchling.build"
+requires = ["setuptools>=42", "wheel"]
+build-backend = "setuptools.build_meta"
 
 [project]
-name = "snapnotes"
+name = "any2md"
 version = "0.1.0"
-description = "任何PDF、PPT/PPTX或PNG系列转Obsidian Markdown，支持Qwen-VL智能图片定位和可选的DeepSeek精炼"
+description = "Convert any document (PDF, PPT/PPTX, PNG) to high-quality Markdown"
 readme = "README.md"
-requires-python = ">=3.8"
 authors = [
-    {name = "Snapnotes Developer", email = "example@example.com"},
+    {name = "TsekaLuk", email = "tsekaluk@example.com"}
 ]
+license = {text = "MIT"}
+classifiers = [
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+]
+keywords = ["pdf", "pptx", "markdown", "conversion", "obsidian"]
 dependencies = [
+    "requests",
+    "PyMuPDF",
     "pdf2image",
     "Pillow",
     "tqdm",
     "python-dotenv",
-    "requests",
     "tenacity",
-    "PyMuPDF",
-    "pyautogui",
 ]
+requires-python = ">=3.8"
 
 [project.optional-dependencies]
-windows = ["comtypes"]
+windows = ["comtypes", "pyautogui"]
+
+[project.urls]
+"Homepage" = "https://github.com/TsekaLuk/any2md"
+"Bug Tracker" = "https://github.com/TsekaLuk/any2md/issues"
 
 [project.scripts]
 any2md = "any2md:main"
 
-[tool.hatch.build.targets.wheel]
-packages = ["any2md.py"] 
+[tool.setuptools]
+packages = ["any2md"]
+
+[tool.uv]
+# UV specific configuration
+resolver = "uri"
+system-packages = true 
