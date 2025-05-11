@@ -937,7 +937,7 @@ def call_llm_for_refinement(markdown_text: str, model_to_use: str, image_metadat
     user_content = markdown_text
     if image_metadata:
         # 将图片元数据格式化为文本，附加到用户输入内容的末尾，或以特定方式提示LLM
-        metadata_prompt = "\n\n--- 图片元数据 (用于参考) ---\n"
+        metadata_prompt = "\n\n--- 图片元数据 (用于上下文参考, 并非必须使用) ---\n"
         for desc, path in image_metadata.items():
             metadata_prompt += f"- 描述: \"{desc}\" -> 路径: \"{path}\"\n"
         user_content += metadata_prompt
@@ -1294,17 +1294,15 @@ def process_presentation(
     final_md = processed_md_text
     if enable_refinement and REFINEMENT_MODEL_NAME:
         logger.info(f"正在使用 {REFINEMENT_MODEL_NAME} 精炼优化 {presentation_path.name} 的Markdown...")
+        raw_markdown_len = len(processed_md_text) # 原始待精炼Markdown的长度
         try:
-            # 2. 构建图像元数据字典
             image_metadata = {}
-            # 从裁剪区域数据中提取
             for slide_idx, data in cropped_regions_data.items():
                 regions = data.get("regions", [])
                 for region in regions:
                     if isinstance(region, dict) and "description" in region and "image_path" in region:
-                        image_metadata[region["description"]] = region["image_path"] # image_path 已经正确
+                        image_metadata[region["description"]] = region["image_path"] 
             
-            # 包含幻灯片原始图像路径
             for i, data_entry in enumerate(slide_image_data_list):
                 if "path" in data_entry and not data_entry.get("error", False):
                     slide_img_path_obj = data_entry["path"]
@@ -1317,18 +1315,28 @@ def process_presentation(
                         rel_path_for_metadata = f"{assets_dir_for_presentation.name}/{slide_img_path_obj.parent.name}/{slide_img_path_obj.name}".replace("\\", "/")
 
                     image_metadata[f"幻灯片 {i+1}"] = rel_path_for_metadata
-                    image_metadata[slide_img_path_obj.name] = rel_path_for_metadata # 使用文件名作为备用键
+                    image_metadata[slide_img_path_obj.name] = rel_path_for_metadata 
             
-            # 调用精炼，并传入构建好的 image_metadata
-            refined_md = call_llm_for_refinement(processed_md_text, REFINEMENT_MODEL_NAME, image_metadata)
-            logger.info(f"Markdown精炼完成 ({presentation_path.name})，准备修正代码包裹和图像引用。")
+            metadata_prompt_str = ""
+            if image_metadata:
+                metadata_prompt_parts = ["\n\n--- 图片元数据 (用于上下文参考, 并非必须使用) ---\n"]
+                for desc, path in image_metadata.items():
+                    metadata_prompt_parts.append(f"- 描述: \"{desc}\" -> 路径: \"{path}\"\n")
+                metadata_prompt_str = "".join(metadata_prompt_parts)
+            
+            input_to_llm_len = raw_markdown_len + len(metadata_prompt_str)
+            logger.info(f"待精炼Markdown长度: {raw_markdown_len}字符, 注入元数据长度: {len(metadata_prompt_str)}字符, LLM总输入长度: {input_to_llm_len}字符 ({presentation_path.name})")
 
-            # 新增：安全机制
-            # 1. 清理代码块包裹
-            refined_md = clean_markdown_code_wrappers(refined_md)
+            refined_md_text_from_llm = call_llm_for_refinement(processed_md_text, REFINEMENT_MODEL_NAME, image_metadata)
+            llm_output_len = len(refined_md_text_from_llm)
             
-            # 修正图像引用 (此时 image_metadata 已是最新的)
-            final_md = fix_image_references(refined_md, image_metadata)
+            cleaned_md_text = clean_markdown_code_wrappers(refined_md_text_from_llm)
+            final_md = fix_image_references(cleaned_md_text, image_metadata) 
+            final_output_len = len(final_md)
+
+            logger.info(f"Markdown精炼各阶段长度: 初始Markdown={raw_markdown_len}, LLM输出={llm_output_len}, 清理与修正后最终输出={final_output_len}字符 ({presentation_path.name})")
+            if final_output_len < raw_markdown_len * 0.5:
+                logger.warning(f"警告: 最终输出的Markdown内容相较于初始转写内容大幅减少! 初始内容长度={raw_markdown_len}字符, 最终输出长度={final_output_len}字符 ({presentation_path.name})")
             logger.info(f"Markdown精炼完成，并已修正代码包裹和图像引用 ({presentation_path.name})")
         except Exception as e:
             logger.warning(f"Markdown精炼失败 ({presentation_path.name}): {e}。使用未精炼的版本。")
@@ -1630,56 +1638,45 @@ def process_pdf(
     if enable_refinement and REFINEMENT_MODEL_NAME:
         try:
             logger.info(f"使用 {REFINEMENT_MODEL_NAME} 精炼优化Markdown中...")
+            raw_markdown_len = len(final_md_text_before_refinement)
             
-            # 构建完整的 image_metadata 以传递给精炼模型
             comprehensive_image_metadata = {}
-            # 从 image_regions_by_page 提取裁剪区域的图片信息
             for page_num, regions_on_page in image_regions_by_page.items():
                 for region in regions_on_page:
                     if isinstance(region, dict) and "description" in region and "image_path" in region:
                         comprehensive_image_metadata[region["description"]] = region["image_path"]
             
-            # 添加 PyMuPDF 模式下全局提取的图片（如果有且未被区域性引用覆盖）
             if image_extraction_method == "pymupdf":
                 for i, path in enumerate(all_extracted_image_paths_relative):
                     img_filename = Path(path).name
-                    # 尝试从文件名生成一个描述性的键，如果这个路径还没有被区域描述引用的话
-                    # 简单的描述，例如基于页码和索引
-                    # 注意：这里的描述可能与VLM生成的占位符描述不完全一致，LLM需要智能处理
                     potential_desc_key = f"来自page_{Path(path).stem.split('_')[0][4:]}_img_{Path(path).stem.split('_')[1][3:]}" 
                     if not any(existing_path == path for existing_path in comprehensive_image_metadata.values()):
-                         # 优先使用文件名作为key，如果文件名是唯一的
                         if img_filename not in comprehensive_image_metadata:
                              comprehensive_image_metadata[img_filename] = path
-                        elif potential_desc_key not in comprehensive_image_metadata: # 否则使用生成的描述key
+                        elif potential_desc_key not in comprehensive_image_metadata: 
                              comprehensive_image_metadata[potential_desc_key] = path
-                        # 也可以考虑为PyMuPDF提取的图片生成更通用的占位符如"[图片1]", "[图片2]"
-                        # 然后在这里将这些通用占位符映射到路径
 
-            refined_md_text = call_llm_for_refinement(final_md_text_before_refinement, REFINEMENT_MODEL_NAME, comprehensive_image_metadata)
+            metadata_prompt_str = ""
+            if comprehensive_image_metadata:
+                metadata_prompt_parts = ["\n\n--- 图片元数据 (用于上下文参考, 并非必须使用) ---\n"]
+                for desc, path in comprehensive_image_metadata.items():
+                    metadata_prompt_parts.append(f"- 描述: \"{desc}\" -> 路径: \"{path}\"\n")
+                metadata_prompt_str = "".join(metadata_prompt_parts)
             
-            # 新增：安全机制
-            # 1. 清理代码块包裹
-            refined_md_text = clean_markdown_code_wrappers(refined_md_text)
+            input_to_llm_len = raw_markdown_len + len(metadata_prompt_str)
+            logger.info(f"待精炼Markdown长度: {raw_markdown_len}字符, 注入元数据长度: {len(metadata_prompt_str)}字符, LLM总输入长度: {input_to_llm_len}字符 ({pdf_path.name})")
+
+            refined_md_text_from_llm = call_llm_for_refinement(final_md_text_before_refinement, REFINEMENT_MODEL_NAME, comprehensive_image_metadata)
+            llm_output_len = len(refined_md_text_from_llm)
             
-            # 2. 构建图像元数据字典
-            image_metadata = {}
-            # 从image_regions_by_page提取
-            for page_num, regions in image_regions_by_page.items():
-                for region in regions:
-                    if isinstance(region, dict) and "description" in region and "image_path" in region:
-                        image_metadata[region["description"]] = region["image_path"]
-            
-            # 同时包含全局提取的图像（如果有）
-            for i, path in enumerate(all_extracted_image_paths_relative):
-                img_filename = Path(path).name
-                # 提取描述（如果可用），否则使用索引
-                img_desc = img_filename.split("_")[1] if len(img_filename.split("_")) > 1 else f"图片{i+1}"
-                image_metadata[img_desc] = path
-                
-            # 修正图像引用
-            final_md_text = fix_image_references(refined_md_text, image_metadata)
-            logger.info(f"Markdown精炼完成，并已修正代码包裹和图像引用")
+            cleaned_md_text = clean_markdown_code_wrappers(refined_md_text_from_llm)
+            final_md_text = fix_image_references(cleaned_md_text, comprehensive_image_metadata) # 使用 comprehensive_image_metadata
+            final_output_len = len(final_md_text)
+
+            logger.info(f"Markdown精炼各阶段长度: 初始Markdown={raw_markdown_len}, LLM输出={llm_output_len}, 清理与修正后最终输出={final_output_len}字符 ({pdf_path.name})")
+            if final_output_len < raw_markdown_len * 0.5:
+                logger.warning(f"警告: 最终输出的Markdown内容相较于初始转写内容大幅减少! 初始内容长度={raw_markdown_len}字符, 最终输出长度={final_output_len}字符 ({pdf_path.name})")
+            logger.info(f"Markdown精炼完成，并已修正代码包裹和图像引用 ({pdf_path.name})")
         except KeyboardInterrupt:
             logger.warning("精炼过程被手动中断。使用未精炼的原始Markdown。")
             final_md_text = final_md_text_before_refinement
@@ -2233,68 +2230,60 @@ def process_png_series(
     if enable_refinement and REFINEMENT_MODEL_NAME:
         try:
             logger.info(f"Series {safe_series_name}: 使用 {REFINEMENT_MODEL_NAME} 精炼优化Markdown中...")
-            raw_length = len(raw_md_text)  # 记录原始长度
-            refined_md_text = call_llm_for_refinement(raw_md_text, REFINEMENT_MODEL_NAME)
-            refined_length = len(refined_md_text)  # 记录精炼后长度
+            raw_markdown_len = len(raw_md_text)  # 原始待精炼Markdown的长度
             
-            # 新增：安全机制
-            # 1. 清理代码块包裹
-            refined_md_text = clean_markdown_code_wrappers(refined_md_text)
-            
-            # 2. 构建图像元数据字典
             image_metadata = {}
-            # 从剪切区域信息中提取
-            for img_idx, regions in cropped_regions_by_image.items():
+            for img_idx, regions in cropped_regions_by_image.items(): 
                 for region in regions:
                     if isinstance(region, dict) and "description" in region and "image_path" in region:
-                        image_metadata[region["description"]] = region["image_path"] # image_path 已经包含了 assets 目录名
+                        image_metadata[region["description"]] = region["image_path"] 
             
-            # 包含PNG原始图像路径 - 修改：使用复制后的、相对于assets目录的路径
             for i, data_entry in enumerate(image_data_list):
-                # copied_asset_path 是相对于 assets_dir_for_series 的路径
-                # Markdown引用路径需要 assets_dir_for_series.name / copied_asset_path.name
                 rel_image_path_str = f"{assets_dir_for_series.name}/{data_entry['copied_asset_path'].name}".replace("\\", "/")
                 image_metadata[f"图片 {i+1}"] = rel_image_path_str
-                image_metadata[data_entry['copied_asset_path'].name] = rel_image_path_str # 使用复制后的文件名作为键
+                image_metadata[data_entry['copied_asset_path'].name] = rel_image_path_str
             
-            # 调用精炼，并传入构建好的 image_metadata
-            refined_md_text = call_llm_for_refinement(raw_md_text, REFINEMENT_MODEL_NAME, image_metadata)
-            refined_length = len(refined_md_text)  # 记录精炼后长度
+            # 记录元数据本身的长度，以便了解注入了多少额外信息
+            metadata_prompt_str = ""
+            if image_metadata:
+                metadata_prompt_parts = ["\n\n--- 图片元数据 (用于上下文参考, 并非必须使用) ---\n"]
+                for desc, path in image_metadata.items():
+                    metadata_prompt_parts.append(f"- 描述: \"{desc}\" -> 路径: \"{path}\"\n")
+                metadata_prompt_str = "".join(metadata_prompt_parts)
             
-            # 新增：安全机制
-            # 1. 清理代码块包裹
-            refined_md_text = clean_markdown_code_wrappers(refined_md_text)
+            input_to_llm_len = raw_markdown_len + len(metadata_prompt_str)
+            logger.info(f"待精炼Markdown长度: {raw_markdown_len}字符, 注入元数据长度: {len(metadata_prompt_str)}字符, LLM总输入长度: {input_to_llm_len}字符")
+
+            refined_md_text_from_llm = call_llm_for_refinement(raw_md_text, REFINEMENT_MODEL_NAME, image_metadata)
+            llm_output_len = len(refined_md_text_from_llm)
             
-            # 2. 构建图像元数据字典
-            image_metadata = {}
-            # 从image_regions_by_page提取
-            for page_num, regions in image_regions_by_page.items():
-                for region in regions:
-                    if isinstance(region, dict) and "description" in region and "image_path" in region:
-                        image_metadata[region["description"]] = region["image_path"]
+            cleaned_md_text = clean_markdown_code_wrappers(refined_md_text_from_llm)
+            final_md_to_write = fix_image_references(cleaned_md_text, image_metadata)
+            final_output_len = len(final_md_to_write)
             
-            # 同时包含全局提取的图像（如果有）
-            for i, path in enumerate(all_extracted_image_paths_relative):
-                img_filename = Path(path).name
-                # 提取描述（如果可用），否则使用索引
-                img_desc = img_filename.split("_")[1] if len(img_filename.split("_")) > 1 else f"图片{i+1}"
-                image_metadata[img_desc] = path
-                
-            # 修正图像引用
-            final_md_text = fix_image_references(refined_md_text, image_metadata)
-            logger.info(f"Markdown精炼完成，并已修正代码包裹和图像引用")
+            logger.info(f"Markdown精炼各阶段长度: 初始Markdown={raw_markdown_len}, LLM输出={llm_output_len}, 清理与修正后最终输出={final_output_len}字符")
+            
+            # 警告判断基于初始Markdown内容和最终输出内容的比较
+            if final_output_len < raw_markdown_len * 0.5:
+                logger.warning(f"警告: 最终输出的Markdown内容相较于初始转写内容大幅减少! 初始内容长度={raw_markdown_len}字符, 最终输出长度={final_output_len}字符")
+                raw_preview = raw_md_text[:200].replace('\n', ' ')
+                final_preview = final_md_to_write[:200].replace('\n', ' ')
+                logger.warning(f"原始内容前200字符: {raw_preview}...")
+                logger.warning(f"精炼后内容前200字符: {final_preview}...")
+            
+            logger.info(f"Series {safe_series_name}: Markdown精炼完成，并已修正代码包裹和图像引用")
         except KeyboardInterrupt:
             logger.warning("精炼过程被手动中断。使用未精炼的原始Markdown。")
-            final_md_text = final_md_text_before_refinement
+            final_md_to_write = raw_md_text # 使用 raw_md_text
         except requests.exceptions.Timeout:
             logger.warning("精炼过程超时。使用未精炼的原始Markdown。")
-            final_md_text = final_md_text_before_refinement
+            final_md_to_write = raw_md_text # 使用 raw_md_text
         except requests.exceptions.RequestException as e:
             logger.warning(f"精炼过程API请求失败: {e}。使用未精炼的原始Markdown。")
-            final_md_text = final_md_text_before_refinement
+            final_md_to_write = raw_md_text # 使用 raw_md_text
         except Exception as e:
-            logger.warning(f"Markdown精炼过程遇到错误: {e}。使用未精炼的原始Markdown。")
-            final_md_text = final_md_text_before_refinement
+            logger.warning(f"Series {safe_series_name}: Markdown精炼失败: {e}。使用未精炼版本。")
+            final_md_to_write = raw_md_text # 使用 raw_md_text
 
     with open(md_output_file, "w", encoding="utf-8") as f:
         f.write(final_md_to_write)
