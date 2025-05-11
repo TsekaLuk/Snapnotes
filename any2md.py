@@ -37,6 +37,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from io import BytesIO
 import concurrent.futures
 from collections import defaultdict
+import logging.handlers
 
 # 检测Windows系统
 import platform
@@ -59,11 +60,35 @@ except ImportError:
     PYAUTOGUI_SUPPORT = False
 
 # 日志配置
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(levelname)s - %(message)s"
+import logging.handlers
+# 创建日志目录
+os.makedirs("logs", exist_ok=True)
+# 设置日志文件路径
+log_file = os.path.join("logs", f"any2md_{time.strftime('%Y%m%d_%H%M%S')}.log")
+
+# 配置日志记录器
+logger = logging.getLogger("any2md")
+logger.setLevel(logging.DEBUG)
+
+# 控制台处理器
+console_handler = logging.StreamHandler()
+console_handler.setLevel(logging.INFO)
+console_format = logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
+console_handler.setFormatter(console_format)
+
+# 文件处理器 - 更详细的日志
+file_handler = logging.handlers.RotatingFileHandler(
+    log_file, maxBytes=10*1024*1024, backupCount=5, encoding="utf-8"
 )
-logger = logging.getLogger(__name__)
+file_handler.setLevel(logging.DEBUG)  # 文件记录DEBUG及以上级别
+file_format = logging.Formatter("%(asctime)s - %(levelname)s - %(module)s:%(lineno)d - %(message)s")
+file_handler.setFormatter(file_format)
+
+# 添加处理器到记录器
+logger.addHandler(console_handler)
+logger.addHandler(file_handler)
+
+logger.info(f"日志文件已创建：{log_file}")
 
 # 在Windows上尝试导入comtypes后给出警告
 if IS_WINDOWS and not COMTYPES_SUPPORT:
@@ -704,7 +729,8 @@ def call_vlm_for_markdown(base64_img: str, custom_instruction: str = None) -> st
     instruction = custom_instruction if custom_instruction else USER_INSTRUCTION
     
     # 记录API调用开始
-    logger.debug(f"开始调用VLM API进行Markdown转写, 指令长度: {len(instruction)}")
+    # 提升日志级别为INFO便于调试
+    logger.info(f"开始调用VLM API进行Markdown转写, 指令长度: {len(instruction)}")
     start_time = time.time()
     
     payload = {
@@ -733,11 +759,12 @@ def call_vlm_for_markdown(base64_img: str, custom_instruction: str = None) -> st
     
     try:
         # 添加更长的超时时间，以处理大图像或复杂请求
+        logger.info(f"发送API请求到URL: {API_URL}, 使用模型: {MODEL}")
         resp = requests.post(API_URL, headers=HEADERS, json=payload, timeout=600)
         
         # 记录响应时间
         elapsed_time = time.time() - start_time
-        logger.debug(f"VLM API响应用时: {elapsed_time:.2f}秒, 状态码: {resp.status_code}")
+        logger.info(f"VLM API响应用时: {elapsed_time:.2f}秒, 状态码: {resp.status_code}")
         
         # 处理HTTP错误
         resp.raise_for_status()
@@ -745,6 +772,7 @@ def call_vlm_for_markdown(base64_img: str, custom_instruction: str = None) -> st
         # 解析响应
         try:
             response_json = resp.json()
+            logger.info(f"成功获取API响应JSON，开始提取内容")
         except json.JSONDecodeError as e:
             logger.error(f"API响应解析错误: {e}, 响应内容: {resp.text[:200]}...")
             raise
@@ -1020,7 +1048,7 @@ def process_presentation(
                 
                 trans_future = executor.submit(call_vlm_for_markdown, data_entry["b64"], slide_instruction)
                 transcription_futures[trans_future] = slide_idx
-                logger.debug(f"幻灯片 {slide_idx+1}: 区域检测完成, 转写任务已提交.")
+                logger.info(f"PNG {slide_idx+1} ({data_entry['path'].name}): 已提交转写任务，当前队列长度: {len(transcription_futures)}")
                 
                 # 控制同时提交的转写任务数量，避免API过载
                 active_futures = [f for f in transcription_futures.keys() if not f.done() and not f.cancelled()]
@@ -1848,57 +1876,60 @@ def process_png_series(
             for loc_future in tqdm(as_completed(localization_futures), total=len(localization_futures), desc=f"Localizing ({safe_series_name})"):
                 i = localization_futures[loc_future]
                 data_entry = image_data_list[i]
-                if data_entry["error"]: # Already handled, but good to check
+                if data_entry["error"]: 
                     continue
+                
+                regions = [] # 默认没有区域
                 try:
                     localization_result = loc_future.result()
                     regions = localization_result.get("image_regions", [])
-                    localized_regions_map[i] = regions # Store for instruction building
+                    localized_regions_map[i] = regions 
                     
-                    # Optional: Visualize localization results here
                     if visualize_localization and regions:
                         try:
                             img_pil = Image.open(data_entry["copied_path"])
-                            # Call the unified cropping/visualization helper if needed, 
-                            # or just draw boxes for PNG series visualization directly.
-                            # For now, just draw simple boxes for PNG series directly without calling _crop_regions_and_get_paths
-                            # as PNGs are usually final images, not pages needing region extraction for VLM input.
-                            # However, the regions data IS useful for the VLM transcription prompt.
                             draw = ImageDraw.Draw(img_pil)
                             for region_idx, region_info in enumerate(regions):
                                 if isinstance(region_info, dict) and region_info.get("bbox"):
                                     x1, y1, x2, y2 = region_info["bbox"]
                                     draw.rectangle([x1,y1,x2,y2], outline="red", width=2)
-                                    font = ImageFont.load_default() # Simple font for viz
+                                    font = ImageFont.load_default()
                                     try: font = ImageFont.truetype("arial.ttf", 12)
                                     except IOError: pass
                                     draw.text((x1,y1-12 if y1 > 12 else y1+2), f"{region_idx+1}:{region_info.get('type','reg')}", fill="red", font=font)
-                                vis_path = data_entry["copied_path"].with_name(f"{data_entry['copied_path'].stem}_viz.png")
-                                img_pil.save(vis_path)
-                                logger.info(f"Saved localization visualization for {data_entry['original_path'].name} to {vis_path.name}")
+                            vis_path = data_entry["copied_path"].with_name(f"{data_entry['copied_path'].stem}_viz.png")
+                            img_pil.save(vis_path)
+                            logger.info(f"Saved localization visualization for {data_entry['original_path'].name} to {vis_path.name}")
                         except Exception as viz_e:
                             logger.warning(f"Visualization failed for {data_entry['original_path'].name}: {viz_e}")
+                except Exception as e:
+                    logger.error(f"PNG {i+1} ({data_entry['original_path'].name}): Localization processing failed: {e}")
+                    # 即使定位失败，也尝试提交转写，但记录错误
+                    markdown_contents[i] = f"[图片 {i+1} ({data_entry['original_path'].name}) 定位失败: {e}]"
+                    # 不再立即continue，而是继续尝试提交转写
 
-                        # Prepare instruction for transcription
-                        slide_instruction = f"这是PNG系列 '{safe_series_name}' 中的第{i+1}张图片 (共{len(image_data_list)}张)。请准确转写图片中的所有内容。"
-                        if regions:
-                            slide_instruction += " 图片识别出以下区域：\n"
-                            for j, region_data in enumerate(regions):
-                                if isinstance(region_data, dict):
-                                    region_type = region_data.get("type", "区域")
-                                    region_desc = region_data.get("description", f"区域{j+1}")
-                                    slide_instruction += f"  - {region_type}: {region_desc}\n"
-                        
-                        # Submit transcription task
+                # 准备 instruction for transcription (无论是否有 regions)
+                slide_instruction = f"这是PNG系列 '{safe_series_name}' 中的第{i+1}张图片 (共{len(image_data_list)}张)。请准确转写图片中的所有内容。"
+                if regions: # 仅当 regions 非空时才添加区域信息
+                    slide_instruction += " 图片识别出以下区域：\n"
+                    for j, region_data in enumerate(regions):
+                        if isinstance(region_data, dict):
+                            region_type = region_data.get("type", "区域")
+                            region_desc = region_data.get("description", f"区域{j+1}")
+                            slide_instruction += f"  - {region_type}: {region_desc}\n"
+                
+                # 确保 data_entry["b64"] 有效才提交任务
+                if data_entry["b64"]:
+                    try:
                         trans_future = executor.submit(call_vlm_for_markdown, data_entry["b64"], slide_instruction)
                         transcription_futures[trans_future] = i
-                        logger.debug(f"PNG {i+1} ({data_entry['original_path'].name}): Localization done, transcription submitted.")
-                except Exception as e:
-                        logger.error(f"PNG {i+1} ({data_entry['original_path'].name}): Error post-localization or during transcription submit: {e}")
-                        markdown_contents[i] = f"[图片 {i+1} ({data_entry['original_path'].name}) 后处理失败: {e}]"
-                except Exception as e:
-                    logger.error(f"PNG {i+1} ({data_entry['original_path'].name}): Error post-localization or during transcription submit: {e}")
-                    markdown_contents[i] = f"[图片 {i+1} ({data_entry['original_path'].name}) 后处理失败: {e}]"
+                        logger.info(f"PNG {i+1} ({data_entry['original_path'].name}): 已提交转写任务，当前队列长度: {len(transcription_futures)}")
+                    except Exception as submit_e:
+                        logger.error(f"PNG {i+1} ({data_entry['original_path'].name}): Error submitting transcription task: {submit_e}")
+                        markdown_contents[i] = f"[图片 {i+1} ({data_entry['original_path'].name}) 转写任务提交失败: {submit_e}]"
+                else:
+                    logger.error(f"PNG {i+1} ({data_entry['original_path'].name}): Base64 data is missing, cannot submit transcription task.")
+                    markdown_contents[i] = f"[图片 {i+1} ({data_entry['original_path'].name}) Base64数据缺失]"
         else: # Not qwen_vl, submit transcriptions directly
             logger.info(f"Series {safe_series_name}: Submitting transcription tasks directly (no localization)...")
             for i, data_entry in enumerate(image_data_list):
@@ -1911,6 +1942,13 @@ def process_png_series(
 
         # Phase 2: Collect all transcription results
         logger.info(f"Series {safe_series_name}: Collecting transcription results...")
+        
+        # 添加这行记录总共需要收集的任务数量
+        logger.info(f"需要收集的转写任务总数: {len(transcription_futures)}")
+        
+        # 初始化收集计数器
+        collected_count = 0
+        
         for trans_future in tqdm(as_completed(transcription_futures), total=len(transcription_futures), desc=f"Transcribing ({safe_series_name})"):
             i = transcription_futures[trans_future]
             data_entry = image_data_list[i]
@@ -1919,13 +1957,19 @@ def process_png_series(
             if markdown_contents[i] is not None and "失败" in markdown_contents[i]: # If error already recorded from previous stage
                  continue
             try:
+                logger.debug(f"PNG {i+1} ({data_entry['original_path'].name}): 尝试获取转写结果...")
                 md_text = trans_future.result()
+                # 添加以下日志信息
                 if not md_text or md_text.strip() == "":
-                    logger.warning(f"PNG {i+1} ({data_entry['original_path'].name}) VLM转写内容为空.")
+                    logger.error(f"PNG {i+1} ({data_entry['original_path'].name}) VLM转写内容为空.")
                     markdown_contents[i] = f"[图片 {i+1} ({data_entry['original_path'].name}) VLM转写内容为空]"
                 else:
+                    # 新增详细日志，记录内容长度和前100个字符
+                    text_preview = md_text[:100].replace('\n', ' ')
+                    logger.info(f"PNG {i+1} ({data_entry['original_path'].name}) VLM返回内容长度: {len(md_text)}, 前100字符: {text_preview}...")
                     markdown_contents[i] = md_text
-                logger.debug(f"PNG {i+1} ({data_entry['original_path'].name}): Transcription complete.")
+                    collected_count += 1
+                    logger.debug(f"PNG {i+1} ({data_entry['original_path'].name}) 转写完成，当前已完成: {collected_count}/{len(transcription_futures)}")
             except Exception as e:
                 logger.error(f"PNG {i+1} ({data_entry['original_path'].name}) VLM转写失败: {e}")
                 markdown_contents[i] = f"[图片 {i+1} ({data_entry['original_path'].name}) VLM转写失败: {e}]"
@@ -1933,13 +1977,32 @@ def process_png_series(
     # Combine Markdown fragments
     final_md_content_parts = []
     final_md_content_parts.append(f"# {safe_series_name}\n")
+    
+    # 记录整个列表状态
+    for i, content in enumerate(markdown_contents):
+        if content is None:
+            logger.error(f"markdown_contents[{i}] 是 None")
+        elif content.startswith("["):
+            logger.warning(f"markdown_contents[{i}] 是错误信息: {content}")
+        else:
+            logger.info(f"markdown_contents[{i}] 有效内容长度: {len(content)} 字符")
+            
     for i, data_entry in enumerate(image_data_list):
+        # 详细记录每个片段的状态
+        logger.info(f"处理片段 {i+1}: 原始路径={data_entry['original_path'].name}")
+        
         # Relative path from md_output_file to the copied_image_path
         # md_output_file is in output_dir. copied_image_path is in output_dir/assets_dir_for_series/slides_dir
         # So, rel_path should be assets_dir_for_series.name / slides_dir.name / copied_image_path.name
         rel_image_path_str = f"{assets_dir_for_series.name}/{slides_dir.name}/{data_entry['copied_path'].name}".replace("\\", "/")
         
         content = markdown_contents[i] if markdown_contents[i] is not None else f"[内容处理失败 for {data_entry['original_path'].name}]"
+        # 记录内容状态
+        if content.startswith("[内容处理失败") or content.startswith("[图片") and "失败" in content:
+            logger.warning(f"片段 {i+1} 内容状态: 失败 - {content}")
+        else:
+            content_preview = content[:50].replace('\n', ' ')
+            logger.info(f"片段 {i+1} 内容状态: 有效内容, 长度={len(content)}, 前50字符={content_preview}...")
         
         final_md_content_parts.append(f"## 图片 {i+1}: {data_entry['original_path'].name}\n")
         final_md_content_parts.append(f"![{data_entry['original_path'].name}]({rel_image_path_str})\n")
@@ -1951,7 +2014,9 @@ def process_png_series(
     if enable_refinement and REFINEMENT_MODEL_NAME:
         try:
             logger.info(f"Series {safe_series_name}: 使用 {REFINEMENT_MODEL_NAME} 精炼优化Markdown中...")
+            raw_length = len(raw_md_text)  # 记录原始长度
             refined_md_text = call_llm_for_refinement(raw_md_text, REFINEMENT_MODEL_NAME)
+            refined_length = len(refined_md_text)  # 记录精炼后长度
             
             # 新增：安全机制
             # 1. 清理代码块包裹
@@ -1974,6 +2039,20 @@ def process_png_series(
             
             # 修正图像引用
             final_md_to_write = fix_image_references(refined_md_text, image_metadata)
+            final_length = len(final_md_to_write)  # 记录最终长度
+            
+            # 记录精炼前后的内容长度变化
+            logger.info(f"Markdown精炼长度变化: 原始={raw_length}字符, 精炼后={refined_length}字符, 修正引用后={final_length}字符")
+            # 记录内容是否有明显减少的警告
+            if final_length < raw_length * 0.5:  # 如果内容减少超过50%
+                logger.warning(f"警告: Markdown精炼后内容大幅减少! 原始={raw_length}字符, 最终={final_length}字符")
+                # 记录原始内容的前200个字符
+                raw_preview = raw_md_text[:200].replace('\n', ' ')
+                # 记录精炼后内容的前200个字符
+                final_preview = final_md_to_write[:200].replace('\n', ' ')
+                logger.warning(f"原始内容前200字符: {raw_preview}...")
+                logger.warning(f"精炼后内容前200字符: {final_preview}...")
+            
             logger.info(f"Series {safe_series_name}: Markdown精炼完成，并已修正代码包裹和图像引用")
         except Exception as e:
             logger.warning(f"Series {safe_series_name}: Markdown精炼失败: {e}。使用未精炼版本。")
