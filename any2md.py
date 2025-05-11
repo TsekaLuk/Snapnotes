@@ -2201,11 +2201,6 @@ def process_png_series(
     for i, data_entry in enumerate(image_data_list):
         # 详细记录每个片段的状态
         logger.info(f"处理片段 {i+1}: 原始路径={data_entry['original_path'].name}, 资源路径={data_entry['copied_asset_path'].name}")
-        
-        # 修改：使用复制到assets目录后的PNG文件路径作为Markdown中的相对引用
-        # copied_asset_path 是相对于 assets_dir_for_series 的路径
-        # Markdown文件和 assets_dir_for_series 在同一 output_dir 下
-        # 因此，相对路径是 assets_dir_for_series.name / copied_asset_path.name
         rel_image_path_str = f"{assets_dir_for_series.name}/{data_entry['copied_asset_path'].name}".replace("\\", "/")
         
         content = markdown_contents[i] if markdown_contents[i] is not None else f"[内容处理失败 for {data_entry['original_path'].name}]"
