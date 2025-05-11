@@ -211,7 +211,7 @@ REFINEMENT_SYSTEM_PROMPT = """你是一名专业的Obsidian Markdown文档编辑
 1. 重复的页眉或页脚：由于逐页转写，原文文档中的页眉页脚可能在合并文本中反复出现。
 2. 格式不一致：不同页面转写的内容可能在Markdown格式（如标题、列表）上存在细微差异，同一逻辑层级的标题却被编码为不同的Markdown层次，例如"## 一、选择题 # 二、填空题 ### 三、解答题"应当修正为"# 一、选择题 # 二、填空题 # 三、解答题"。
 3. 逻辑中断：较长的段落、题目或解题步骤可能因为跨页而被切断。
-4. 图片占位符：文中可能包含 `[图片]` 或 `[图片:一些描述]` 这样的占位符。这些占位符本身不需要你处理，它们将在后续步骤中被替换为实际的图片链接。你的任务是确保这些占位符周围的文本格式正确且逻辑连贯。
+4. 图片占位符：文中可能包含 `[图片]` 或 `[图片:一些描述]` 这样的占位符。你的任务是确保这些占位符周围的文本格式正确且逻辑连贯。
 5. PPT特有格式问题：对于PPT幻灯片转写的内容，可能存在标题层级不一致或多余的分页标记。
 6. 加粗符号：**内容**的**前后最好加一个空格，例如"**【答案】**6"修正为"**【答案】** 6"这样加粗才会正确渲染。
 7. 选项格式问题：带图片的选择题选项可能错误地使用了列表格式（如"- (A) ![图片](...)"），这会导致图片无法正确渲染。需要删除选项前的"-"等列表标记，仅保留"(A) ![图片](...)"格式。
@@ -228,7 +228,12 @@ C. **提升内容连贯性**：
    - 尽力识别并逻辑上连接那些因分节（分页或分幻灯片）而被中断的内容。例如，如果一个段落或步骤明显在下一部分继续，请尝试平滑地将它们整合。
    - 修正因分节导致的突兀的换行或段落中断。
 D. **保持内容准确性**：在进行格式调整和结构优化的同时，【绝对不能修改原始文本的语义内容或数学公式的准确性】。你的核心是优化结构和移除冗余元信息，而非重写、删减或解释内容，请保证内容的完整性与一致性。
-E. **输出纯净文本**： 输出内容【仅能包含纯粹的 Markdown 文本】，不包含任何额外的解释或代码块包裹。请删除任何在Markdown文本的开头或结尾出现的任何如 ```markdown ... ``` 这样的代码块包裹。
+E. **图片引用和占位符处理**：
+   - 如果用户在输入中提供了图片元数据（一个描述到路径的映射），请利用这些信息。
+   - 当你在文本中遇到 `[图片:描述]` 这样的占位符时，如果元数据中有对应的"描述"，请将其替换转义为正确的Markdown图片链接 `![描述](路径)`。
+   - 如果遇到有描述的占位符 `[图片:描述]`，但在元数据中找不到该"描述"，或者遇到无描述的 `[图片]` 占位符，请【删除】这些无法解析的占位符，因为它们在最终文档中无法渲染。
+   - 你的主要任务是格式化和连贯性。在删除无法解析的占位符后，请确保周围文本的逻辑和可读性不受影响。
+F. **输出纯净文本**： 输出内容【仅能包含纯粹的 Markdown 文本】，不包含任何额外的解释或代码块包裹。请删除任何在Markdown文本的开头或结尾出现的任何如 ```markdown ... ``` 这样的代码块包裹。
 
 请仔细分析输入文本，并输出一份高质量、结构清晰、阅读流畅的最终Obsidian Markdown文档。
 """
@@ -924,25 +929,39 @@ def call_vlm_for_markdown(base64_img: str, custom_instruction: str = None) -> st
 # 新增：用于第二阶段精炼的LLM调用函数
 @tenacity.retry(wait=tenacity.wait_fixed(5), stop=tenacity.stop_after_attempt(3),
                 retry=tenacity.retry_if_exception_type((requests.exceptions.RequestException,)))
-def call_llm_for_refinement(markdown_text: str, model_to_use: str) -> str:
+def call_llm_for_refinement(markdown_text: str, model_to_use: str, image_metadata: Optional[Dict[str, str]] = None) -> str:
     """
     给定一个 Markdown 文本调用大语言模型（如 DeepSeek）并返回精炼后的 Markdown
+    新增参数 image_metadata 允许传入图片描述到路径的映射，用于辅助LLM处理图片引用。
     """
+    user_content = markdown_text
+    if image_metadata:
+        # 将图片元数据格式化为文本，附加到用户输入内容的末尾，或以特定方式提示LLM
+        metadata_prompt = "\n\n--- 图片元数据 (用于参考) ---\n"
+        for desc, path in image_metadata.items():
+            metadata_prompt += f"- 描述: \"{desc}\" -> 路径: \"{path}\"\n"
+        user_content += metadata_prompt
+        logger.info(f"向精炼模型传入了 {len(image_metadata)} 条图片元数据。")
+        logger.debug(f"传入精炼模型的图片元数据详情:\n{metadata_prompt}")
+
     payload = {
         "model": model_to_use,
         "messages": [
             {"role": "system", "content": REFINEMENT_SYSTEM_PROMPT},
-            {"role": "user", "content": markdown_text}
+            {"role": "user", "content": user_content}
         ],
         "stream": False,
         "temperature": 0.2,
-        "max_tokens": 4096,
+        "max_tokens": 4096, # 保持足够大的max_tokens以处理元数据和文本
         "enable_thinking": False
     }
     # 使用 REFINEMENT_API_URL 和 REFINEMENT_HEADERS，添加超时设置
+    logger.info(f"调用精炼API ({model_to_use})，输入内容长度(含元数据): {len(user_content)}")
     resp = requests.post(REFINEMENT_API_URL, headers=REFINEMENT_HEADERS, json=payload, timeout=300)
     resp.raise_for_status()
-    return resp.json()["choices"][0]["message"]["content"]
+    refined_text = resp.json()["choices"][0]["message"]["content"]
+    logger.info(f"精炼API ({model_to_use}) 返回内容长度: {len(refined_text)}")
+    return refined_text
 
 # --- 新增：PPTX 直接转图片 ---
 def convert_presentation_to_images_with_libreoffice(presentation_path: Path, output_folder: Path, dpi: int = 300) -> List[Path]:
@@ -1260,9 +1279,9 @@ def process_presentation(
     for slide_idx, data in cropped_regions_data.items():
         regions = data["regions"]
         for region_idx, region in enumerate(regions):
-            if isinstance(region, dict) and region.get("type") and region.get("cropped_path"):
-                # 构建相对路径
-                region_rel_path = f"{data['asset_base']}/{Path(region['cropped_path']).name}".replace("\\", "/")
+            if isinstance(region, dict) and region.get("type") and "image_path" in region: # 确保image_path存在
+                # 构建相对路径 - 直接使用 region["image_path"]，它已经是正确的相对路径
+                region_rel_path = region["image_path"].replace("\\", "/")
                 region_type = region.get("type", "图片")
                 region_desc = region.get("description", f"区域{region_idx+1}")
                 
@@ -1276,12 +1295,6 @@ def process_presentation(
     if enable_refinement and REFINEMENT_MODEL_NAME:
         logger.info(f"正在使用 {REFINEMENT_MODEL_NAME} 精炼优化 {presentation_path.name} 的Markdown...")
         try:
-            refined_md = call_llm_for_refinement(processed_md_text, REFINEMENT_MODEL_NAME)
-            
-            # 新增：安全机制
-            # 1. 清理代码块包裹
-            refined_md = clean_markdown_code_wrappers(refined_md)
-            
             # 2. 构建图像元数据字典
             image_metadata = {}
             # 从裁剪区域数据中提取
@@ -1289,18 +1302,32 @@ def process_presentation(
                 regions = data.get("regions", [])
                 for region in regions:
                     if isinstance(region, dict) and "description" in region and "image_path" in region:
-                        image_metadata[region["description"]] = region["image_path"]
+                        image_metadata[region["description"]] = region["image_path"] # image_path 已经正确
             
             # 包含幻灯片原始图像路径
             for i, data_entry in enumerate(slide_image_data_list):
                 if "path" in data_entry and not data_entry.get("error", False):
-                    # 使用data_entry中的path替代copied_path和original_path
                     slide_img_path_obj = data_entry["path"]
-                    rel_path = f"{assets_dir_for_presentation.name}/{slide_img_path_obj.name}".replace("\\", "/")
-                    image_metadata[f"幻灯片 {i+1}"] = rel_path
-                    image_metadata[slide_img_path_obj.name] = rel_path
+                    try:
+                        abs_slide_path = slide_img_path_obj.resolve()
+                        abs_output_dir = output_dir.resolve()
+                        rel_path_for_metadata = str(abs_slide_path.relative_to(abs_output_dir)).replace("\\", "/")
+                    except ValueError:
+                        logger.warning(f"无法为幻灯片 {i+1} 的元数据计算相对路径，尝试拼接。")
+                        rel_path_for_metadata = f"{assets_dir_for_presentation.name}/{slide_img_path_obj.parent.name}/{slide_img_path_obj.name}".replace("\\", "/")
+
+                    image_metadata[f"幻灯片 {i+1}"] = rel_path_for_metadata
+                    image_metadata[slide_img_path_obj.name] = rel_path_for_metadata # 使用文件名作为备用键
             
-            # 修正图像引用
+            # 调用精炼，并传入构建好的 image_metadata
+            refined_md = call_llm_for_refinement(processed_md_text, REFINEMENT_MODEL_NAME, image_metadata)
+            logger.info(f"Markdown精炼完成 ({presentation_path.name})，准备修正代码包裹和图像引用。")
+
+            # 新增：安全机制
+            # 1. 清理代码块包裹
+            refined_md = clean_markdown_code_wrappers(refined_md)
+            
+            # 修正图像引用 (此时 image_metadata 已是最新的)
             final_md = fix_image_references(refined_md, image_metadata)
             logger.info(f"Markdown精炼完成，并已修正代码包裹和图像引用 ({presentation_path.name})")
         except Exception as e:
@@ -1603,7 +1630,33 @@ def process_pdf(
     if enable_refinement and REFINEMENT_MODEL_NAME:
         try:
             logger.info(f"使用 {REFINEMENT_MODEL_NAME} 精炼优化Markdown中...")
-            refined_md_text = call_llm_for_refinement(final_md_text_before_refinement, REFINEMENT_MODEL_NAME)
+            
+            # 构建完整的 image_metadata 以传递给精炼模型
+            comprehensive_image_metadata = {}
+            # 从 image_regions_by_page 提取裁剪区域的图片信息
+            for page_num, regions_on_page in image_regions_by_page.items():
+                for region in regions_on_page:
+                    if isinstance(region, dict) and "description" in region and "image_path" in region:
+                        comprehensive_image_metadata[region["description"]] = region["image_path"]
+            
+            # 添加 PyMuPDF 模式下全局提取的图片（如果有且未被区域性引用覆盖）
+            if image_extraction_method == "pymupdf":
+                for i, path in enumerate(all_extracted_image_paths_relative):
+                    img_filename = Path(path).name
+                    # 尝试从文件名生成一个描述性的键，如果这个路径还没有被区域描述引用的话
+                    # 简单的描述，例如基于页码和索引
+                    # 注意：这里的描述可能与VLM生成的占位符描述不完全一致，LLM需要智能处理
+                    potential_desc_key = f"来自page_{Path(path).stem.split('_')[0][4:]}_img_{Path(path).stem.split('_')[1][3:]}" 
+                    if not any(existing_path == path for existing_path in comprehensive_image_metadata.values()):
+                         # 优先使用文件名作为key，如果文件名是唯一的
+                        if img_filename not in comprehensive_image_metadata:
+                             comprehensive_image_metadata[img_filename] = path
+                        elif potential_desc_key not in comprehensive_image_metadata: # 否则使用生成的描述key
+                             comprehensive_image_metadata[potential_desc_key] = path
+                        # 也可以考虑为PyMuPDF提取的图片生成更通用的占位符如"[图片1]", "[图片2]"
+                        # 然后在这里将这些通用占位符映射到路径
+
+            refined_md_text = call_llm_for_refinement(final_md_text_before_refinement, REFINEMENT_MODEL_NAME, comprehensive_image_metadata)
             
             # 新增：安全机制
             # 1. 清理代码块包裹
@@ -1654,51 +1707,74 @@ def process_page_to_markdown(pdf_path: Path, page_num: int, dpi: int, image_regi
     如果提供了image_regions，会将图像区域信息注入到用户指令中
     如果提供了page_image_pil and page_b64_str, 则跳过图像转换
     """
+    logger.debug(f"Page {page_num + 1}: 开始处理Markdown转写。")
     try:
         if page_image_pil is None or page_b64_str is None:
-            logger.debug(f"Page {page_num + 1}: Converting to image for VLM.")
+            logger.debug(f"Page {page_num + 1}: 转换页面为图像...")
             page_image_pil = convert_pdf_page_to_image(pdf_path, page_num, dpi)
             page_b64_str = image_to_base64(page_image_pil)
+            logger.debug(f"Page {page_num + 1}: 页面图像转换完成。")
         else:
-            logger.debug(f"Page {page_num + 1}: Using pre-converted image for VLM.")
+            logger.debug(f"Page {page_num + 1}: 使用预转换的页面图像。")
         
         # 构建可能带有图像信息的自定义指令
         custom_instruction = USER_INSTRUCTION
         if image_regions and len(image_regions) > 0:
-            custom_instruction += "\n\n本页包含以下特殊区域，请按以下要求处理：\n"
+            logger.info(f"Page {page_num + 1}: 检测到 {len(image_regions)} 个图像区域，准备注入提示词。")
+            instruction_parts = [USER_INSTRUCTION, "\n\n本页包含以下特殊区域，请按以下要求处理：\n"]
             for i, region in enumerate(image_regions):
-                # 类型检查以防止"'str' object has no attribute 'get'"错误
                 if not isinstance(region, dict):
-                    logger.warning(f"页面的区域{i+1}不是预期的字典格式，将跳过")
+                    logger.warning(f"Page {page_num + 1}: 区域 {i+1} 不是预期的字典格式，跳过此区域。")
                     continue
-                    
+                
                 region_type = region.get("type", "").lower()
                 desc = region.get("description", f"区域{i+1}")
-                bbox = region.get("bbox", [0, 0, 1, 1])
-                image_path_in_region = region.get("image_path") # Check if image path is available
+                bbox_str = str(region.get("bbox", "[未知BBOX]")) # 转换为字符串以确保可记录
+                image_path_in_region = region.get("image_path")
+                
+                logger.debug(f"Page {page_num + 1}: 区域 {i+1} - 类型: {region_type}, 描述: {desc}, BBOX: {bbox_str}, 路径: {image_path_in_region}")
                 
                 placeholder_desc = desc
-                if image_path_in_region:
-                    # If we have a specific path for this region's image, use it in the placeholder
-                    # This assumes the VLM will see [图片:path] and replace path with the actual image link later
-                    # Or, more directly, use the description if available
-                    placeholder_desc = desc # Use original description for VLM prompt
+                # placeholder_desc目前未使用image_path_in_region，因为VLM主要通过描述来关联
 
                 if "table" in region_type:
-                    # 对表格区域给予特殊处理指令
-                    custom_instruction += f"{i+1}. [表格区域] 坐标: {bbox} - 描述: {desc}\n"
-                    custom_instruction += f"   请优先尝试将此表格转换为结构化的Markdown表格格式。\n"
-                    custom_instruction += f"   只有在表格结构特别复杂，无法准确转换时，才使用 [图片:{placeholder_desc}] 占位符。\n"
+                    instruction_parts.append(f"{i+1}. [表格区域] 坐标: {bbox_str} - 描述: {desc}\n")
+                    instruction_parts.append(f"   请优先尝试将此表格转换为结构化的Markdown表格格式。\n")
+                    instruction_parts.append(f"   只有在表格结构特别复杂，无法准确转换时，才使用 [图片:{placeholder_desc}] 占位符。\n")
                 else:
-                    # 对图像区域使用正常的占位符指令
-                    custom_instruction += f"{i+1}. [图像区域] 坐标: {bbox} - 描述: {desc}\n"
-                    custom_instruction += f"   请使用 [图片:{placeholder_desc}] 占位符。\n"
+                    instruction_parts.append(f"{i+1}. [图像区域] 坐标: {bbox_str} - 描述: {desc}\n")
+                    instruction_parts.append(f"   请使用 [图片:{placeholder_desc}] 占位符。\n")
             
-            custom_instruction += "\n对于表格区域，请尽可能地转换为Markdown表格，确保保留原始表格的所有内容和格式。"
-            custom_instruction += "\n只有在表格非常复杂（如包含复杂角分割逻辑、合并单元格、多重嵌套表格等）无法准确转换时，才使用图片占位符。"
+            instruction_parts.append("\n对于表格区域，请尽可能地转换为Markdown表格，确保保留原始表格的所有内容和格式。")
+            instruction_parts.append("\n只有在表格非常复杂（如包含复杂角分割逻辑、合并单元格、多重嵌套表格等）无法准确转换时，才使用图片占位符。")
+            custom_instruction = "".join(instruction_parts)
+            logger.info(f"Page {page_num + 1}: 图像区域提示词构建完成，总长度: {len(custom_instruction)}。")
+            logger.debug(f"Page {page_num + 1}: 注入的完整提示词: \n{custom_instruction}") # 记录完整提示词
+        else:
+            logger.info(f"Page {page_num + 1}: 未检测到图像区域，使用标准提示词。")
         
         # 调用VLM进行转写，传入自定义指令
+        logger.debug(f"Page {page_num + 1}: 调用VLM API进行转写...")
         md_text = call_vlm_for_markdown(page_b64_str, custom_instruction)
+        logger.info(f"Page {page_num + 1}: VLM转写成功，获得Markdown文本长度: {len(md_text)}。")
+        
+        # Debug: 检查转写文本是否包含预期的占位符
+        if image_regions and len(image_regions) > 0:
+            placeholders_found = 0
+            placeholders_missing = []
+            for region in image_regions:
+                if isinstance(region, dict):
+                    desc = region.get("description", f"区域{i+1}") # 修正i的范围问题
+                    expected_placeholder = f"[图片:{desc}]"
+                    if expected_placeholder in md_text:
+                        placeholders_found += 1
+                    else:
+                        placeholders_missing.append(expected_placeholder)
+            
+            logger.debug(f"Page {page_num + 1}: 转写文本占位符检查 - 找到: {placeholders_found}, 期望总数: {len(image_regions)}")
+            if placeholders_missing:
+                logger.warning(f"Page {page_num + 1}: 以下占位符在转写文本中缺失: {placeholders_missing}")
+        
         return md_text
     except tenacity.RetryError as e:
         last_exception = e.last_attempt.exception()
@@ -1713,7 +1789,7 @@ def process_page_to_markdown(pdf_path: Path, page_num: int, dpi: int, image_regi
         return f"[第{page_num+1}页VLM转写失败: {error_details}]"
     except Exception as e:
         error_details = f"Unexpected error during VLM processing for page {page_num + 1}: {type(e).__name__} - {str(e)[:200]}"
-        logger.error(f"❌ VLM ERROR for page {page_num + 1}: {error_details}")
+        logger.error(f"❌ VLM ERROR for page {page_num + 1}: {error_details}", exc_info=True) # 添加exc_info
         return f"[第{page_num+1}页VLM转写失败: {error_details}]"
 
 # 在适当位置添加检测LibreOffice和调用它进行转换的函数
@@ -1932,19 +2008,24 @@ def process_png_series(
     
     md_output_file = output_dir / f"{safe_series_name}.md"
     assets_dir_for_series = output_dir / f"{safe_series_name}_assets"
-
+    # 删除regions_dir，直接使用assets_dir作为裁剪图像存储目录
+    
     assets_dir_for_series.mkdir(parents=True, exist_ok=True)
     
-    image_data_list = [] # List of dicts: {"id": i, "original_path": Path, "b64": str, "error": bool}
-    logger.info(f"准备PNG图像数据 {safe_series_name} (base64编码)...")
+    # 修改：复制PNG文件到assets目录，并更新image_data_list中的路径信息
+    image_data_list = [] # List of dicts: {"id": i, "original_path": Path, "copied_asset_path": Path, "b64": str, "error": bool}
+    logger.info(f"准备PNG图像数据 {safe_series_name} (复制并进行base64编码)...")
     for i, original_png_path_obj in enumerate(png_files):
-        entry = {"id": i, "original_path": original_png_path_obj, "b64": None, "error": False}
+        copied_asset_path = assets_dir_for_series / original_png_path_obj.name
+        entry = {"id": i, "original_path": original_png_path_obj, "copied_asset_path": copied_asset_path, "b64": None, "error": False}
         try:
-            # 直接从原始文件读取
-            with open(original_png_path_obj, "rb") as img_file:
+            shutil.copy2(original_png_path_obj, copied_asset_path) # 复制文件
+            logger.debug(f"已将 {original_png_path_obj.name} 复制到 {copied_asset_path}")
+            # 从复制后的文件读取base64
+            with open(copied_asset_path, "rb") as img_file:
                 entry["b64"] = base64.b64encode(img_file.read()).decode("utf-8")
         except Exception as e:
-            logger.error(f"无法读取或编码PNG {original_png_path_obj.name} for series {safe_series_name}: {e}")
+            logger.error(f"无法复制或编码PNG {original_png_path_obj.name} for series {safe_series_name}: {e}")
             entry["error"] = True
         image_data_list.append(entry)
 
@@ -2119,13 +2200,13 @@ def process_png_series(
             
     for i, data_entry in enumerate(image_data_list):
         # 详细记录每个片段的状态
-        logger.info(f"处理片段 {i+1}: 原始路径={data_entry['original_path'].name}")
+        logger.info(f"处理片段 {i+1}: 原始路径={data_entry['original_path'].name}, 资源路径={data_entry['copied_asset_path'].name}")
         
-        # 修改：使用原始PNG文件路径作为Markdown中的相对引用
-        # 原始PNG文件路径相对于Markdown输出文件的位置
-        # 如果是绝对路径中的文件，需要获取相对于当前工作目录的路径
-        rel_path = data_entry['original_path'].resolve().relative_to(output_dir.resolve()) if data_entry['original_path'].is_absolute() else data_entry['original_path']
-        rel_image_path_str = str(rel_path).replace("\\", "/")
+        # 修改：使用复制到assets目录后的PNG文件路径作为Markdown中的相对引用
+        # copied_asset_path 是相对于 assets_dir_for_series 的路径
+        # Markdown文件和 assets_dir_for_series 在同一 output_dir 下
+        # 因此，相对路径是 assets_dir_for_series.name / copied_asset_path.name
+        rel_image_path_str = f"{assets_dir_for_series.name}/{data_entry['copied_asset_path'].name}".replace("\\", "/")
         
         content = markdown_contents[i] if markdown_contents[i] is not None else f"[内容处理失败 for {data_entry['original_path'].name}]"
         # 记录内容状态
@@ -2171,36 +2252,54 @@ def process_png_series(
             for img_idx, regions in cropped_regions_by_image.items():
                 for region in regions:
                     if isinstance(region, dict) and "description" in region and "image_path" in region:
+                        image_metadata[region["description"]] = region["image_path"] # image_path 已经包含了 assets 目录名
+            
+            # 包含PNG原始图像路径 - 修改：使用复制后的、相对于assets目录的路径
+            for i, data_entry in enumerate(image_data_list):
+                # copied_asset_path 是相对于 assets_dir_for_series 的路径
+                # Markdown引用路径需要 assets_dir_for_series.name / copied_asset_path.name
+                rel_image_path_str = f"{assets_dir_for_series.name}/{data_entry['copied_asset_path'].name}".replace("\\", "/")
+                image_metadata[f"图片 {i+1}"] = rel_image_path_str
+                image_metadata[data_entry['copied_asset_path'].name] = rel_image_path_str # 使用复制后的文件名作为键
+            
+            # 调用精炼，并传入构建好的 image_metadata
+            refined_md_text = call_llm_for_refinement(raw_md_text, REFINEMENT_MODEL_NAME, image_metadata)
+            refined_length = len(refined_md_text)  # 记录精炼后长度
+            
+            # 新增：安全机制
+            # 1. 清理代码块包裹
+            refined_md_text = clean_markdown_code_wrappers(refined_md_text)
+            
+            # 2. 构建图像元数据字典
+            image_metadata = {}
+            # 从image_regions_by_page提取
+            for page_num, regions in image_regions_by_page.items():
+                for region in regions:
+                    if isinstance(region, dict) and "description" in region and "image_path" in region:
                         image_metadata[region["description"]] = region["image_path"]
             
-            # 包含PNG原始图像路径 - 修改：直接使用原始PNG路径
-            for i, data_entry in enumerate(image_data_list):
-                # 计算相对路径
-                rel_path = data_entry['original_path'].resolve().relative_to(output_dir.resolve()) if data_entry['original_path'].is_absolute() else data_entry['original_path']
-                rel_image_path_str = str(rel_path).replace("\\", "/")
-                image_metadata[f"图片 {i+1}"] = rel_image_path_str
-                image_metadata[data_entry['original_path'].name] = rel_image_path_str
-            
+            # 同时包含全局提取的图像（如果有）
+            for i, path in enumerate(all_extracted_image_paths_relative):
+                img_filename = Path(path).name
+                # 提取描述（如果可用），否则使用索引
+                img_desc = img_filename.split("_")[1] if len(img_filename.split("_")) > 1 else f"图片{i+1}"
+                image_metadata[img_desc] = path
+                
             # 修正图像引用
-            final_md_to_write = fix_image_references(refined_md_text, image_metadata)
-            final_length = len(final_md_to_write)  # 记录最终长度
-            
-            # 记录精炼前后的内容长度变化
-            logger.info(f"Markdown精炼长度变化: 原始={raw_length}字符, 精炼后={refined_length}字符, 修正引用后={final_length}字符")
-            # 记录内容是否有明显减少的警告
-            if final_length < raw_length * 0.5:  # 如果内容减少超过50%
-                logger.warning(f"警告: Markdown精炼后内容大幅减少! 原始={raw_length}字符, 最终={final_length}字符")
-                # 记录原始内容的前200个字符
-                raw_preview = raw_md_text[:200].replace('\n', ' ')
-                # 记录精炼后内容的前200个字符
-                final_preview = final_md_to_write[:200].replace('\n', ' ')
-                logger.warning(f"原始内容前200字符: {raw_preview}...")
-                logger.warning(f"精炼后内容前200字符: {final_preview}...")
-            
-            logger.info(f"Series {safe_series_name}: Markdown精炼完成，并已修正代码包裹和图像引用")
+            final_md_text = fix_image_references(refined_md_text, image_metadata)
+            logger.info(f"Markdown精炼完成，并已修正代码包裹和图像引用")
+        except KeyboardInterrupt:
+            logger.warning("精炼过程被手动中断。使用未精炼的原始Markdown。")
+            final_md_text = final_md_text_before_refinement
+        except requests.exceptions.Timeout:
+            logger.warning("精炼过程超时。使用未精炼的原始Markdown。")
+            final_md_text = final_md_text_before_refinement
+        except requests.exceptions.RequestException as e:
+            logger.warning(f"精炼过程API请求失败: {e}。使用未精炼的原始Markdown。")
+            final_md_text = final_md_text_before_refinement
         except Exception as e:
-            logger.warning(f"Series {safe_series_name}: Markdown精炼失败: {e}。使用未精炼版本。")
-            final_md_to_write = raw_md_text
+            logger.warning(f"Markdown精炼过程遇到错误: {e}。使用未精炼的原始Markdown。")
+            final_md_text = final_md_text_before_refinement
 
     with open(md_output_file, "w", encoding="utf-8") as f:
         f.write(final_md_to_write)
