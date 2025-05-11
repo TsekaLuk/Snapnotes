@@ -38,6 +38,7 @@ from io import BytesIO
 import concurrent.futures
 from collections import defaultdict
 import logging.handlers
+from threading import Semaphore # Import Semaphore
 
 # 检测Windows系统
 import platform
@@ -101,8 +102,9 @@ load_dotenv()
 API_URL = os.getenv("SF_API_URL", "https://api.siliconflow.cn/v1/chat/completions")
 API_KEY = os.getenv("SF_API_KEY")
 MODEL = os.getenv("SF_MODEL", "Qwen/Qwen2.5-VL-72B-Instruct")
-SF_MAX_WORKERS = int(os.getenv("SF_MAX_WORKERS", "10"))
-MAX_CONCURRENT_API_CALLS = int(os.getenv("MAX_CONCURRENT_API_CALLS", "3"))
+SF_MAX_WORKERS = int(os.getenv("SF_MAX_WORKERS", "10")) # This will be used by ThreadPoolExecutor
+MAX_CONCURRENT_API_CALLS = int(os.getenv("MAX_CONCURRENT_API_CALLS", "3")) # Max concurrent calls to the actual API
+API_SEMAPHORE = Semaphore(MAX_CONCURRENT_API_CALLS) # Initialize semaphore for API calls
 
 # 新增：用于第二阶段精炼的配置
 REFINEMENT_MODEL_NAME = os.getenv("REFINEMENT_MODEL", "deepseek-ai/DeepSeek-V2.5")
@@ -463,109 +465,119 @@ def _crop_regions_and_get_paths(
 ) -> Tuple[List[str], List[Dict]]:
     """
     Crops regions from a given page image based on pre-determined image_regions.
-    Saves cropped images and returns their relative paths and updated region info.
-    Designed to be called after localization.
-
+    
     Args:
-        page_image: PIL.Image object of the page.
-        page_number: The 0-indexed page number.
+        page_image: PIL Image of the full page.
+        page_number: 0-indexed page number.
         image_regions: List of dictionaries, each describing a region with 'bbox'.
-        output_dir: The specific directory to save cropped images (e.g., assets_dir / pdf_stem_assets).
-        visualize: Whether to save a debug image with bounding boxes.
-
+        output_dir: Directory to save cropped images.
+        visualize: Whether to save a visualization for debugging.
+    
     Returns:
-        A tuple containing:
-        - List[str]: Relative paths of the saved cropped images.
+        - List[str]: Relative paths to the saved images.
         - List[Dict]: The input image_regions list, with an 'image_path' key added to each region dict.
     """
-    output_dir.mkdir(parents=True, exist_ok=True)
+    saved_image_relative_paths = []
     
     if not image_regions:
-        logger.info(f"No image regions provided for page {page_number} for cropping.")
-        return [], []
-
-    if visualize:
-        debug_image = page_image.copy()
-        draw = ImageDraw.Draw(debug_image)
+        logger.debug(f"No regions to crop for page {page_number+1}.")
+        return saved_image_relative_paths, []
     
-    saved_image_relative_paths = []
+    # Make sure output_dir exists
+    output_dir.mkdir(parents=True, exist_ok=True)
+    
     updated_regions = []
-
+    
     for i, region in enumerate(image_regions):
-        # Ensure region is a dictionary before trying to access its items
         if not isinstance(region, dict):
-            logger.warning(f"Region {i} on page {page_number} is not a dict: {region}. Skipping.")
+            logger.warning(f"Region {i} for page {page_number+1} is not a dictionary: {region}")
             updated_regions.append(region) # Keep original if not processable
             continue
-
-        bbox = region.get("bbox")
-        if not bbox or len(bbox) != 4:
-            logger.warning(f"Invalid or missing bbox for region {i} on page {page_number}: {bbox}. Skipping.")
-            updated_regions.append(region)
-            continue
-
-        try:
-            x1, y1, x2, y2 = [int(coord) for coord in bbox]
-        except ValueError:
-            logger.warning(f"Non-integer coordinates in bbox for region {i} on page {page_number}: {bbox}. Skipping.")
-            updated_regions.append(region)
-            continue
-            
-        # Ensure coordinates are within image bounds and valid
-        x1 = max(0, x1)
-        y1 = max(0, y1)
-        x2 = min(page_image.width, x2)
-        y2 = min(page_image.height, y2)
-
-        if x2 <= x1 or y2 <= y1 or (x2 - x1) < 20 or (y2 - y1) < 20: # Added minimum size check
-            logger.debug(f"Region {i} on page {page_number} is too small or invalid after clamping: [{x1},{y1},{x2},{y2}]. Skipping.")
-            updated_regions.append(region)
-            continue
-            
-        cropped_image = page_image.crop((x1, y1, x2, y2))
         
-        region_desc = region.get("description", f"region_{i+1}")
-        safe_desc = "".join(c if c.isalnum() or c in "- " else "_" for c in region_desc).strip().replace(" ", "_")
-        # Limit filename length for descriptions
-        safe_desc = safe_desc[:50] if len(safe_desc) > 50 else safe_desc
-
-
-        filename = f"page{page_number+1}_{safe_desc}_{i+1}.png"
-        absolute_output_path = output_dir / filename
+        if "bbox" not in region:
+            logger.warning(f"Region {i} for page {page_number+1} has no bbox: {region}")
+            updated_regions.append(region)
+            continue
+        
+        bbox = region["bbox"]
+        if not isinstance(bbox, list) or len(bbox) != 4:
+            logger.warning(f"Invalid bbox format for region {i} on page {page_number+1}: {bbox}")
+            updated_regions.append(region)
+            continue
         
         try:
-            cropped_image.save(absolute_output_path, format="PNG")
-            # Relative path from the main output_dir/pdf_stem.md to assets_dir/pdf_stem_assets/image.png
-            # output_dir here is 'assets_dir' passed from process_pdf. So, assets_dir.name / filename
-            relative_path = str(Path(output_dir.name) / filename).replace("\\\\", "/")
-            saved_image_relative_paths.append(relative_path)
+            # Get region information
+            x1, y1, x2, y2 = bbox
             
-            # Add image_path to the region dictionary
+            # Make sure coordinates are within image bounds and in the right order
+            width, height = page_image.size
+            x1 = max(0, min(x1, width))
+            y1 = max(0, min(y1, height))
+            x2 = max(0, min(x2, width))
+            y2 = max(0, min(y2, height))
+            
+            # Ensure x1 < x2 and y1 < y2
+            if x1 > x2: x1, x2 = x2, x1
+            if y1 > y2: y1, y2 = y2, y1
+            
+            # Skip very small regions (could be noise)
+            if x2 - x1 < 5 or y2 - y1 < 5:
+                logger.warning(f"Region {i} on page {page_number+1} is too small: {bbox}")
+                updated_regions.append(region)
+                continue
+                
+            # Create a copy of the region dict to add an image_path key
             current_region_copy = region.copy()
-            current_region_copy["image_path"] = relative_path
+            
+            # Crop the image
+            region_image = page_image.crop((x1, y1, x2, y2))
+            
+            # Get or generate a descriptive name for the region
+            region_type = region.get("type", "区域")
+            region_description = region.get("description", region_type)
+            safe_desc = "".join(c if c.isalnum() or c in "- " else "_" for c in region_description).strip().replace(" ", "_")
+            if not safe_desc:
+                safe_desc = f"region_{i+1}"
+            
+            # 修改：直接使用 output_dir 而不是创建子目录
+            image_filename = f"page{page_number+1}_{safe_desc}_{i+1}.png"
+            image_path = output_dir / image_filename
+            
+            # Save the cropped image
+            region_image.save(image_path)
+            
+            # 必须包含assets目录名，确保从Markdown文件可以正确引用
+            # 获取output_dir的名称（通常是assets目录名）
+            output_dir_name = output_dir.name
+            # 构建完整的相对路径
+            rel_path = f"{output_dir_name}/{image_filename}".replace("\\", "/")
+            saved_image_relative_paths.append(rel_path)
+            
+            # Add path to region info - 也要使用完整相对路径
+            current_region_copy["image_path"] = rel_path
             updated_regions.append(current_region_copy)
-
-            if visualize:
-                draw.rectangle([x1, y1, x2, y2], outline="red", width=3)
-                try:
-                    # Attempt to load a default font if available, otherwise skip text
-                    font = ImageFont.truetype("arial.ttf", 15)
-                except IOError:
-                    font = ImageFont.load_default()
-                draw.text((x1, y1 - 15 if y1 > 15 else y1 + 5), f"{i+1}:{region.get('type','img')}", fill="red", font=font)
-
+            logger.debug(f"Saved region {i+1} from page {page_number+1} to {rel_path}")
         except Exception as e:
-            logger.error(f"Failed to save cropped image {filename} for page {page_number}: {e}")
+            logger.error(f"Error cropping region {i+1} from page {page_number+1}: {e}")
             updated_regions.append(region) # Add original region if save fails
-
+    
     if visualize and any(isinstance(r, dict) and r.get("bbox") for r in image_regions): # only save if there were valid regions to draw
         debug_path = output_dir / f"page{page_number+1}_regions_debug.png"
-        try:
-            debug_image.save(debug_path)
-            logger.info(f"Saved visualization with bounding boxes for page {page_number+1} to {debug_path}")
-        except Exception as e:
-            logger.error(f"Failed to save debug image for page {page_number+1}: {e}")
-            
+        debug_img = page_image.copy()
+        draw = ImageDraw.Draw(debug_img)
+        for i, region in enumerate(image_regions):
+            if isinstance(region, dict) and region.get("bbox"):
+                x1, y1, x2, y2 = region["bbox"]
+                draw.rectangle([x1, y1, x2, y2], outline="red", width=2)
+                # Try to use TrueType font but fall back to default if not available
+                try:
+                    font = ImageFont.truetype("arial.ttf", 12)
+                except IOError:
+                    font = ImageFont.load_default()
+                draw.text((x1, y1-10), str(i+1), fill="red", font=font)
+        debug_img.save(debug_path)
+        logger.debug(f"Saved visualization of {len(image_regions)} regions to {debug_path}")
+    
     return saved_image_relative_paths, updated_regions
 
 def extract_images_from_page_with_qwen_vl(
@@ -586,7 +598,11 @@ def extract_images_from_page_with_qwen_vl(
     if visualize:
         debug_image = page_image.copy()
         draw = ImageDraw.Draw(debug_image)
+    
+    # 获取output_dir的名称（通常是assets目录名）
+    output_dir_name = output_dir.name
     saved_image_paths = []
+    
     for i, region in enumerate(image_regions):
         bbox = region.get("bbox")
         if not bbox or len(bbox) != 4:
@@ -605,7 +621,11 @@ def extract_images_from_page_with_qwen_vl(
         filename = f"page{page_number+1}_{safe_desc}_{i+1}.png"
         output_path = output_dir / filename
         cropped_image.save(output_path, format="PNG")
-        saved_image_paths.append(output_path)
+        
+        # 修复：返回包含assets目录名的相对路径
+        rel_path = f"{output_dir_name}/{filename}".replace("\\", "/")
+        saved_image_paths.append(rel_path)
+        
         if visualize:
             draw.rectangle([x1, y1, x2, y2], outline="red", width=3)
             draw.text((x1, y1-15), f"{i+1}", fill="red")
@@ -717,9 +737,10 @@ def extract_images_from_pdf_with_pymupdf(pdf_path: Path, output_dir: Path, min_d
 
 # --- VLM转写API调用 ---
 @tenacity.retry(
-    wait=tenacity.wait_exponential(multiplier=1, min=2, max=30), # 指数避退策略，初始等待2秒，最大等待30秒
-    stop=tenacity.stop_after_attempt(8), # 最大重试次数
-    retry=tenacity.retry_if_exception_type((requests.exceptions.RequestException,)),
+    wait=tenacity.wait_exponential(multiplier=2, min=5, max=60), # 修改：增加初始等待时间至5秒，最大等待时间至60秒，倍率为2
+    stop=tenacity.stop_after_attempt(6), # 修改：减少最大重试次数以避免过长等待
+    retry=tenacity.retry_if_exception_type((requests.exceptions.RequestException,)), # Retry on any request exception
+    reraise=True, # 确保重试后仍会抛出原始异常
 )
 def call_vlm_for_markdown(base64_img: str, custom_instruction: str = None) -> str:
     """
@@ -728,96 +749,177 @@ def call_vlm_for_markdown(base64_img: str, custom_instruction: str = None) -> st
     """
     instruction = custom_instruction if custom_instruction else USER_INSTRUCTION
     
-    # 记录API调用开始
-    # 提升日志级别为INFO便于调试
-    logger.info(f"开始调用VLM API进行Markdown转写, 指令长度: {len(instruction)}")
-    start_time = time.time()
+    # 全局变量用于追踪API调用状态，如果不存在则初始化
+    global _consecutive_api_failures, _last_error_code, _last_error_time
+    if '_consecutive_api_failures' not in globals():
+        _consecutive_api_failures = 0
+        _last_error_code = None
+        _last_error_time = 0
     
-    payload = {
-        "model": MODEL,
-        "messages": [
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {
-                "role": "user",
-                "content": [
-                    {
-                        "type": "image_url",
-                        "image_url": {
-                            "url": f"data:image/webp;base64,{base64_img}",
-                            "detail": "high"
-                        }
-                    },
-                    {"type": "text", "text": instruction}
-                ]
-            }
-        ],
-        "stream": False,
-        "temperature": 0.1,
-        "max_tokens": 4096,
-        "enable_thinking": False
-    }
+    # 自适应延迟逻辑
+    current_time = time.time()
+    time_since_last_error = current_time - _last_error_time
     
-    try:
-        # 添加更长的超时时间，以处理大图像或复杂请求
-        logger.info(f"发送API请求到URL: {API_URL}, 使用模型: {MODEL}")
-        resp = requests.post(API_URL, headers=HEADERS, json=payload, timeout=600)
+    # 如果有连续失败且时间间隔过短，增加额外等待
+    if _consecutive_api_failures > 0 and time_since_last_error < 5:
+        # 根据连续失败次数和上次错误类型动态计算等待时间
+        adaptive_wait = min(5 * _consecutive_api_failures, 30)
         
-        # 记录响应时间
-        elapsed_time = time.time() - start_time
-        logger.info(f"VLM API响应用时: {elapsed_time:.2f}秒, 状态码: {resp.status_code}")
+        # 对503错误特殊处理，给服务器更多恢复时间
+        if _last_error_code == 503:
+            adaptive_wait = min(10 * _consecutive_api_failures, 60)
         
-        # 处理HTTP错误
-        resp.raise_for_status()
+        logger.info(f"检测到连续失败 ({_consecutive_api_failures}次), 自适应等待 {adaptive_wait}秒后重试")
+        time.sleep(adaptive_wait)
+    
+    logger.info(f"等待API信号量 (可用: {API_SEMAPHORE._value}/{MAX_CONCURRENT_API_CALLS})")
+    with API_SEMAPHORE: # Acquire semaphore before making an API call
+        logger.info(f"已获取API信号量，开始调用VLM API进行Markdown转写, 指令长度: {len(instruction)}")
+        start_time = time.time()
         
-        # 解析响应
+        payload = {
+            "model": MODEL,
+            "messages": [
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "image_url",
+                            "image_url": {
+                                "url": f"data:image/webp;base64,{base64_img}",
+                                "detail": "high"
+                            }
+                        },
+                        {"type": "text", "text": instruction}
+                    ]
+                }
+            ],
+            "stream": False,
+            "temperature": 0.1,
+            "max_tokens": 4096,
+            "enable_thinking": False
+        }
+    
         try:
-            response_json = resp.json()
-            logger.info(f"成功获取API响应JSON，开始提取内容")
-        except json.JSONDecodeError as e:
-            logger.error(f"API响应解析错误: {e}, 响应内容: {resp.text[:200]}...")
-            raise
+            # 添加更长的超时时间，以处理大图像或复杂请求
+            logger.info(f"发送API请求到URL: {API_URL}, 使用模型: {MODEL}")
+            resp = requests.post(API_URL, headers=HEADERS, json=payload, timeout=600)
+            
+            # 记录响应时间
+            elapsed_time = time.time() - start_time
+            logger.info(f"VLM API响应用时: {elapsed_time:.2f}秒, 状态码: {resp.status_code}")
+            
+            # 成功响应，重置连续失败计数
+            _consecutive_api_failures = 0
+            _last_error_code = None
+            
+            # 处理HTTP错误
+            resp.raise_for_status() # This will raise an HTTPError for bad responses (4xx or 5xx)
+            
+            # 解析响应
+            try:
+                response_json = resp.json()
+                logger.info(f"成功获取API响应JSON，开始提取内容")
+            except json.JSONDecodeError as e:
+                logger.error(f"API响应解析错误: {e}, 响应内容: {resp.text[:200]}...")
+                raise
+            
+            # 检查响应格式
+            if "choices" not in response_json or len(response_json["choices"]) == 0:
+                logger.error(f"API返回无效响应: 缺少choices字段, 响应: {response_json}")
+                return f"[API返回格式错误: 缺少choices字段]"
+            
+            if "message" not in response_json["choices"][0]:
+                logger.error(f"API返回无效响应: 缺少message字段, 响应: {response_json['choices'][0]}")
+                return f"[API返回格式错误: 缺少message字段]"
+            
+            if "content" not in response_json["choices"][0]["message"]:
+                logger.error(f"API返回无效响应: 缺少content字段, 响应: {response_json['choices'][0]['message']}")
+                return f"[API返回格式错误: 缺少content字段]"
+            
+            text_content = response_json["choices"][0]["message"]["content"]
+            
+            # 检查内容是否为空
+            if not text_content or text_content.strip() == "":
+                logger.warning("API返回了空内容")
+                return "[API返回了空内容]"
+            
+            # 检查内容长度是否符合预期
+            if len(text_content) < 10:  # 任意小的阈值，用于检测异常短的回复
+                logger.warning(f"API返回内容可能异常简短: {text_content}")
+            
+            logger.debug(f"成功获取VLM转写结果，内容长度: {len(text_content)}")
+            return text_content
         
-        # 检查响应格式
-        if "choices" not in response_json or len(response_json["choices"]) == 0:
-            logger.error(f"API返回无效响应: 缺少choices字段, 响应: {response_json}")
-            return f"[API返回格式错误: 缺少choices字段]"
-        
-        if "message" not in response_json["choices"][0]:
-            logger.error(f"API返回无效响应: 缺少message字段, 响应: {response_json['choices'][0]}")
-            return f"[API返回格式错误: 缺少message字段]"
-        
-        if "content" not in response_json["choices"][0]["message"]:
-            logger.error(f"API返回无效响应: 缺少content字段, 响应: {response_json['choices'][0]['message']}")
-            return f"[API返回格式错误: 缺少content字段]"
-        
-        text_content = response_json["choices"][0]["message"]["content"]
-        
-        # 检查内容是否为空
-        if not text_content or text_content.strip() == "":
-            logger.warning("API返回了空内容")
-            return "[API返回了空内容]"
-        
-        # 检查内容长度是否符合预期
-        if len(text_content) < 10:  # 任意小的阈值，用于检测异常短的回复
-            logger.warning(f"API返回内容可能异常简短: {text_content}")
-        
-        logger.debug(f"成功获取VLM转写结果，内容长度: {len(text_content)}")
-        return text_content
-    
-    except requests.exceptions.Timeout:
-        logger.error(f"VLM API调用超时 (超过600秒)")
-        raise
-    except requests.exceptions.ConnectionError as e:
-        logger.error(f"VLM API连接错误: {e}")
-        raise
-    except requests.exceptions.HTTPError as e:
-        logger.error(f"VLM API HTTP错误: {e}, 状态码: {e.response.status_code}")
-        if e.response.status_code == 429:
-            logger.warning("可能遇到API速率限制，减慢请求速度")
-        raise
-    except Exception as e:
-        logger.error(f"VLM API调用过程中发生未知错误: {type(e).__name__} - {e}")
-        raise
+        except requests.exceptions.Timeout:
+            # 更新失败状态
+            _consecutive_api_failures += 1
+            _last_error_code = "timeout"
+            _last_error_time = time.time()
+            
+            logger.error(f"VLM API调用超时 (超过600秒), 连续失败次数: {_consecutive_api_failures}")
+            # 超时通常意味着服务端负载过高，增加等待时间
+            adaptive_wait = min(8 * _consecutive_api_failures, 40)
+            logger.info(f"超时后延迟 {adaptive_wait} 秒")
+            time.sleep(adaptive_wait)
+            raise # Reraise for tenacity to handle
+            
+        except requests.exceptions.ConnectionError as e:
+            # 更新失败状态
+            _consecutive_api_failures += 1
+            _last_error_code = "connection"
+            _last_error_time = time.time()
+            
+            logger.error(f"VLM API连接错误: {e}, 连续失败次数: {_consecutive_api_failures}")
+            # 连接错误可能是网络或服务端问题，适当增加等待
+            adaptive_wait = min(5 * _consecutive_api_failures, 30)
+            logger.info(f"连接错误后延迟 {adaptive_wait} 秒")
+            time.sleep(adaptive_wait)
+            raise # Reraise for tenacity to handle
+            
+        except requests.exceptions.HTTPError as e:
+            # 更新失败状态
+            _consecutive_api_failures += 1
+            _last_error_code = e.response.status_code if e.response else "http"
+            _last_error_time = time.time()
+            
+            logger.error(f"VLM API HTTP错误: {e}, 状态码: {_last_error_code}, 连续失败次数: {_consecutive_api_failures}")
+            
+            if e.response and e.response.status_code == 429: # Rate limit
+                logger.warning("可能遇到API速率限制 (429)")
+                # 对于429速率限制错误，指数级增加等待
+                adaptive_wait = min(15 * _consecutive_api_failures, 120)
+                logger.info(f"速率限制后延迟 {adaptive_wait} 秒")
+                time.sleep(adaptive_wait)
+                
+            elif e.response and e.response.status_code == 503: # Service unavailable
+                logger.warning("服务不可用 (503)")
+                # 对于503服务不可用错误，使用更长的等待时间
+                adaptive_wait = min(20 * _consecutive_api_failures, 180)
+                logger.info(f"服务不可用后延迟 {adaptive_wait} 秒")
+                time.sleep(adaptive_wait)
+                
+            else:
+                # 其他HTTP错误，基础等待
+                adaptive_wait = min(5 * _consecutive_api_failures, 30)
+                logger.info(f"HTTP错误后延迟 {adaptive_wait} 秒")
+                time.sleep(adaptive_wait)
+                
+            raise # Reraise for tenacity to handle
+            
+        except Exception as e:
+            # 更新失败状态
+            _consecutive_api_failures += 1
+            _last_error_code = "unknown"
+            _last_error_time = time.time()
+            
+            logger.error(f"VLM API调用过程中发生未知错误: {type(e).__name__} - {e}, 连续失败次数: {_consecutive_api_failures}")
+            # 未知错误使用中等等待时间
+            adaptive_wait = min(7 * _consecutive_api_failures, 35)
+            logger.info(f"未知错误后延迟 {adaptive_wait} 秒")
+            time.sleep(adaptive_wait)
+            raise # Reraise for tenacity to handle
 
 # 新增：用于第二阶段精炼的LLM调用函数
 @tenacity.retry(wait=tenacity.wait_fixed(5), stop=tenacity.stop_after_attempt(3),
@@ -1830,30 +1932,26 @@ def process_png_series(
     
     md_output_file = output_dir / f"{safe_series_name}.md"
     assets_dir_for_series = output_dir / f"{safe_series_name}_assets"
-    # slides_dir is where original PNGs are copied to, for consistent relative paths
-    slides_dir = assets_dir_for_series / f"{safe_series_name}_slides" 
+
     assets_dir_for_series.mkdir(parents=True, exist_ok=True)
-    slides_dir.mkdir(parents=True, exist_ok=True)
     
-    # Copy original PNGs to a structured slide_dir and prepare base64 data
-    # This also serves as the `saved_images` list of paths within the assets structure
-    image_data_list = [] # List of dicts: {"id": i, "original_path": Path, "copied_path": Path, "b64": str, "error": bool}
-    logger.info(f"Preparing image data for {safe_series_name} (copying and base64 encoding)...")
+    image_data_list = [] # List of dicts: {"id": i, "original_path": Path, "b64": str, "error": bool}
+    logger.info(f"准备PNG图像数据 {safe_series_name} (base64编码)...")
     for i, original_png_path_obj in enumerate(png_files):
-        copied_image_path = slides_dir / f"slide_{i+1}_{original_png_path_obj.name}"
-        entry = {"id": i, "original_path": original_png_path_obj, "copied_path": copied_image_path, "b64": None, "error": False}
+        entry = {"id": i, "original_path": original_png_path_obj, "b64": None, "error": False}
         try:
-            shutil.copy(original_png_path_obj, copied_image_path)
-            with open(copied_image_path, "rb") as img_file:
+            # 直接从原始文件读取
+            with open(original_png_path_obj, "rb") as img_file:
                 entry["b64"] = base64.b64encode(img_file.read()).decode("utf-8")
         except Exception as e:
-            logger.error(f"Failed to copy or encode PNG {original_png_path_obj.name} for series {safe_series_name}: {e}")
+            logger.error(f"无法读取或编码PNG {original_png_path_obj.name} for series {safe_series_name}: {e}")
             entry["error"] = True
         image_data_list.append(entry)
 
     markdown_contents = [None] * len(image_data_list)
     # To store {index: regions_data} from localization
     localized_regions_map = {}
+    cropped_regions_by_image = {}
 
     with ThreadPoolExecutor(max_workers=SF_MAX_WORKERS) as executor:
         localization_futures = {} # future -> image_index
@@ -1885,9 +1983,31 @@ def process_png_series(
                     regions = localization_result.get("image_regions", [])
                     localized_regions_map[i] = regions 
                     
+                    # 新增：如果检测到区域，就裁剪并保存区域图像
+                    if regions:
+                        logger.info(f"PNG {i+1} ({data_entry['original_path'].name}): 检测到 {len(regions)} 个区域，开始裁剪")
+                        try:
+                            # 打开原始图像 - 直接从原始路径打开
+                            img_pil = Image.open(data_entry["original_path"])
+                            
+                            # 裁剪并保存每个区域 - 修改为直接使用assets_dir而不是regions_dir
+                            saved_region_paths, updated_regions = _crop_regions_and_get_paths(
+                                page_image=img_pil,
+                                page_number=i,  # 使用图片索引作为页码
+                                image_regions=regions,
+                                output_dir=assets_dir_for_series,  # 使用assets_dir而不是regions_dir
+                                visualize=visualize_localization
+                            )
+                            
+                            # 存储已裁剪的区域信息
+                            cropped_regions_by_image[i] = updated_regions
+                            logger.info(f"PNG {i+1} ({data_entry['original_path'].name}): 成功裁剪并保存 {len(saved_region_paths)} 个区域")
+                        except Exception as crop_err:
+                            logger.error(f"PNG {i+1} ({data_entry['original_path'].name}): 裁剪区域失败: {crop_err}")
+                    
                     if visualize_localization and regions:
                         try:
-                            img_pil = Image.open(data_entry["copied_path"])
+                            img_pil = Image.open(data_entry["original_path"])
                             draw = ImageDraw.Draw(img_pil)
                             for region_idx, region_info in enumerate(regions):
                                 if isinstance(region_info, dict) and region_info.get("bbox"):
@@ -1897,7 +2017,8 @@ def process_png_series(
                                     try: font = ImageFont.truetype("arial.ttf", 12)
                                     except IOError: pass
                                     draw.text((x1,y1-12 if y1 > 12 else y1+2), f"{region_idx+1}:{region_info.get('type','reg')}", fill="red", font=font)
-                            vis_path = data_entry["copied_path"].with_name(f"{data_entry['copied_path'].stem}_viz.png")
+                            # 修改为在assets_dir_for_series目录中保存可视化结果
+                            vis_path = assets_dir_for_series / f"{data_entry['original_path'].name.split('.')[0]}_viz.png"
                             img_pil.save(vis_path)
                             logger.info(f"Saved localization visualization for {data_entry['original_path'].name} to {vis_path.name}")
                         except Exception as viz_e:
@@ -1906,11 +2027,20 @@ def process_png_series(
                     logger.error(f"PNG {i+1} ({data_entry['original_path'].name}): Localization processing failed: {e}")
                     # 即使定位失败，也尝试提交转写，但记录错误
                     markdown_contents[i] = f"[图片 {i+1} ({data_entry['original_path'].name}) 定位失败: {e}]"
-                    # 不再立即continue，而是继续尝试提交转写
 
                 # 准备 instruction for transcription (无论是否有 regions)
                 slide_instruction = f"这是PNG系列 '{safe_series_name}' 中的第{i+1}张图片 (共{len(image_data_list)}张)。请准确转写图片中的所有内容。"
-                if regions: # 仅当 regions 非空时才添加区域信息
+                
+                # 如果有剪切的区域，在指令中加入区域信息
+                if i in cropped_regions_by_image and cropped_regions_by_image[i]:
+                    slide_instruction += " 图片识别出以下区域：\n"
+                    for j, region_data in enumerate(cropped_regions_by_image[i]):
+                        if isinstance(region_data, dict):
+                            region_type = region_data.get("type", "区域")
+                            region_desc = region_data.get("description", f"区域{j+1}")
+                            region_path = region_data.get("image_path", "")
+                            slide_instruction += f"  - {region_type}: {region_desc} (已裁剪并保存为 {region_path})\n"
+                elif regions: # 如果有检测区域但没有裁剪成功，仍然提供区域信息
                     slide_instruction += " 图片识别出以下区域：\n"
                     for j, region_data in enumerate(regions):
                         if isinstance(region_data, dict):
@@ -1991,10 +2121,11 @@ def process_png_series(
         # 详细记录每个片段的状态
         logger.info(f"处理片段 {i+1}: 原始路径={data_entry['original_path'].name}")
         
-        # Relative path from md_output_file to the copied_image_path
-        # md_output_file is in output_dir. copied_image_path is in output_dir/assets_dir_for_series/slides_dir
-        # So, rel_path should be assets_dir_for_series.name / slides_dir.name / copied_image_path.name
-        rel_image_path_str = f"{assets_dir_for_series.name}/{slides_dir.name}/{data_entry['copied_path'].name}".replace("\\", "/")
+        # 修改：使用原始PNG文件路径作为Markdown中的相对引用
+        # 原始PNG文件路径相对于Markdown输出文件的位置
+        # 如果是绝对路径中的文件，需要获取相对于当前工作目录的路径
+        rel_path = data_entry['original_path'].resolve().relative_to(output_dir.resolve()) if data_entry['original_path'].is_absolute() else data_entry['original_path']
+        rel_image_path_str = str(rel_path).replace("\\", "/")
         
         content = markdown_contents[i] if markdown_contents[i] is not None else f"[内容处理失败 for {data_entry['original_path'].name}]"
         # 记录内容状态
@@ -2006,6 +2137,18 @@ def process_png_series(
         
         final_md_content_parts.append(f"## 图片 {i+1}: {data_entry['original_path'].name}\n")
         final_md_content_parts.append(f"![{data_entry['original_path'].name}]({rel_image_path_str})\n")
+        
+        # 新增：如果有裁剪的区域，添加区域图像的引用
+        if i in cropped_regions_by_image and cropped_regions_by_image[i]:
+            final_md_content_parts.append(f"\n### 检测到的区域：\n\n")
+            for j, region_data in enumerate(cropped_regions_by_image[i]):
+                if isinstance(region_data, dict) and "image_path" in region_data:
+                    region_type = region_data.get("type", "区域")
+                    region_desc = region_data.get("description", f"区域{j+1}")
+                    region_path = region_data.get("image_path", "")
+                    final_md_content_parts.append(f"#### {region_type}: {region_desc}\n\n")
+                    final_md_content_parts.append(f"![{region_desc}]({region_path})\n\n")
+        
         final_md_content_parts.append(f"{content}\n\n---\n")
     
     raw_md_text = "".join(final_md_content_parts)
@@ -2024,18 +2167,19 @@ def process_png_series(
             
             # 2. 构建图像元数据字典
             image_metadata = {}
-            # 从localized_regions_map中提取
-            for img_idx, regions in localized_regions_map.items():
+            # 从剪切区域信息中提取
+            for img_idx, regions in cropped_regions_by_image.items():
                 for region in regions:
                     if isinstance(region, dict) and "description" in region and "image_path" in region:
                         image_metadata[region["description"]] = region["image_path"]
             
-            # 包含PNG原始图像路径
+            # 包含PNG原始图像路径 - 修改：直接使用原始PNG路径
             for i, data_entry in enumerate(image_data_list):
-                if "copied_path" in data_entry and "original_path" in data_entry:
-                    rel_path = f"{assets_dir_for_series.name}/{slides_dir.name}/{data_entry['copied_path'].name}".replace("\\", "/")
-                    image_metadata[f"图片 {i+1}"] = rel_path
-                    image_metadata[data_entry['original_path'].name] = rel_path
+                # 计算相对路径
+                rel_path = data_entry['original_path'].resolve().relative_to(output_dir.resolve()) if data_entry['original_path'].is_absolute() else data_entry['original_path']
+                rel_image_path_str = str(rel_path).replace("\\", "/")
+                image_metadata[f"图片 {i+1}"] = rel_image_path_str
+                image_metadata[data_entry['original_path'].name] = rel_image_path_str
             
             # 修正图像引用
             final_md_to_write = fix_image_references(refined_md_text, image_metadata)
