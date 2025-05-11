@@ -1,47 +1,10 @@
-# Python
+# Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
 *$py.class
+
+# C extensions
 *.so
-.Python
-env/
-build/
-develop-eggs/
-dist/
-downloads/
-eggs/
-.eggs/
-lib/
-lib64/
-parts/
-sdist/
-var/
-*.egg-info/
-.installed.cfg
-*.egg
-
-# Virtual Environments
-venv/
-ENV/
-.venv/
-.uv/
-
-# Environment variables
-.env
-
-# Obsidian files and output
-output/
-*_assets/
-
-# IDE files
-.idea/
-.vscode/
-*.swp
-*.swo
-
-# OS specific
-.DS_Store
-Thumbs.db
 
 # Distribution / packaging
 .Python
@@ -84,12 +47,24 @@ coverage.xml
 # Jupyter Notebook
 .ipynb_checkpoints
 
+# Environment
+.env
+.venv
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+
 # VS Code
 .vscode/
 *.code-workspace
 
 # PyCharm
 .idea/
+
+# Output files
+output/
 
 # Temporary files
 *.tmp
